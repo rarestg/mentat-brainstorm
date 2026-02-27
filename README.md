@@ -14,32 +14,39 @@ The loop: Velocity drives awareness (competitive, shareable). Scan drives conver
 
 ## Repo Structure
 
+The thinking evolved in layers: Notion raw notes → standalone essays → long-form drafts → polished specs. The repo mirrors that lineage.
+
 ```
-spec/                          # Product specs (the polished, current docs)
-  mentat-scan.md               # Mentat Scan — The 6 Protocols, scoring, scanner architecture
-  mentat-velocity.md           # Mentat Velocity — Leaderboard, crowns, profile page, go-to-market
+spec/                              # Product specs (the polished, current source of truth)
+  mentat-scan.md                   #   Mentat Scan — 6 Protocols, scoring, scanner architecture
+  mentat-velocity.md               #   Mentat Velocity — Leaderboard, crowns, profile page, GTM
 
-brainstorm/                    # Raw thinking, early drafts, Notion exports
-  project-overview.md          # Original project vision, name ideas, form factor options
-  the-cycle.md                 # The 5-stage bottleneck framework (Plan → Code → Review → Test → Deploy)
-  signals.md                   # What signals we can realistically scan in a codebase
-  reading-list.md              # Reference articles and blog posts
-  autonomous-sdlc-thoughts.md  # The "hobby project → factory" essay + original scanner blueprint
-  autonomous-readiness-framework-long.md   # Extended version of the scan spec (with history/philosophy)
-  velocity-leaderboard-long.md             # Extended version of the velocity spec (with full metrics breakdown)
+brainstorm/
+  notion/                          # Raw exports from our Notion workspace (will keep growing)
+    project-overview.md            #   Original project vision, name ideas, form factor options
+    the-cycle.md                   #   The 5-stage bottleneck framework (Plan → Code → Review → Test → Deploy)
+    signals.md                     #   What signals we can realistically scan in a codebase
+    reading-list.md                #   Reference articles and blog posts
+  thoughts/                        # Standalone thinking — reactions to the Notion notes + research
+    autonomous-sdlc-thoughts.md    #   The "hobby project → factory" essay + original scanner blueprint
+  drafts/                          # Long-form drafts that were condensed into the specs
+    autonomous-readiness-framework-long.md   #   Extended scan spec (includes industrial history + philosophy)
+    velocity-leaderboard-long.md             #   Extended velocity spec (full metrics breakdown + shareables)
 
-research/                      # External reference material
-  ona/blog/                    # Ona (formerly Gitpod) blog posts
+research/                          # External reference material
+  ona/blog/                        #   Ona (formerly Gitpod) blog posts
     industrializing-software-development.md
     the-self-driving-codebase.md
     last-year-of-localhost.md
     dont-build-a-sandbox.md
-  ona/docs/                    # Ona product docs
+  ona/docs/                        #   Ona product documentation
     what-is-ona.md
     how-ona-works.md
 
-_archive/                      # Superseded drafts
+_archive/                          # Superseded earlier drafts
 ```
+
+**How things flow:** New Notion exports land in `brainstorm/notion/`. Reactions and essays go in `brainstorm/thoughts/`. When thinking matures into a long-form draft, it goes in `brainstorm/drafts/`. When a draft is condensed into a product spec, it goes in `spec/`.
 
 ---
 
