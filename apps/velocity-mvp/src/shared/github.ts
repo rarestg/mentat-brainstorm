@@ -5,10 +5,12 @@ import type { RepoRef } from './repoUrl';
 const GITHUB_API = 'https://api.github.com';
 const GITHUB_OAUTH_TOKEN_URL = 'https://github.com/login/oauth/access_token';
 const DEFAULT_TTL_MS = 3 * 60 * 1000;
-const MAX_PAGES = 10;
+const MAX_COMMIT_PAGES = 10;
+const MAX_MERGED_PR_PAGES = 60;
 const GITHUB_FETCH_TIMEOUT_MS = 8_000;
-const MAX_CI_VERIFICATION_PRS = 20;
 const CI_VERIFICATION_CONCURRENCY = 4;
+const CI_VERIFICATION_SOFT_CAP_MID = 150;
+const CI_VERIFICATION_SOFT_CAP_HIGH = 250;
 
 interface GitHubBranchMetadata {
   default_branch?: string;
@@ -34,6 +36,23 @@ interface GitHubOAuthTokenResponse {
   scope?: string;
   error?: string;
   error_description?: string;
+}
+
+type VerificationConfidence = 'high' | 'medium' | 'low';
+
+interface MergedPrIngestionMetadata {
+  pagesFetched: number;
+  maxPages: number;
+  truncated: boolean;
+}
+
+interface CiVerificationMetadata {
+  evaluatedPrs: number;
+  totalMergedPrs: number;
+  coverageRatio: number;
+  cap: number;
+  capped: boolean;
+  confidence: VerificationConfidence;
 }
 
 export interface GitHubAuthenticatedUser {
@@ -209,6 +228,33 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
+function resolveCiVerificationCap(totalMergedPrs: number): number {
+  if (totalMergedPrs <= 80) {
+    return totalMergedPrs;
+  }
+  if (totalMergedPrs <= 300) {
+    return CI_VERIFICATION_SOFT_CAP_MID;
+  }
+  return CI_VERIFICATION_SOFT_CAP_HIGH;
+}
+
+function toCoverageRatio(evaluatedPrs: number, totalMergedPrs: number): number {
+  if (totalMergedPrs <= 0) {
+    return 1;
+  }
+  return Math.round((evaluatedPrs / totalMergedPrs) * 10_000) / 10_000;
+}
+
+function inferVerificationConfidence(coverageRatio: number): VerificationConfidence {
+  if (coverageRatio >= 0.95) {
+    return 'high';
+  }
+  if (coverageRatio >= 0.6) {
+    return 'medium';
+  }
+  return 'low';
+}
+
 async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
   const controller = new AbortController();
   const timeout = setTimeout(() => {
@@ -303,7 +349,7 @@ export async function fetchCommitsForWindow(
 ): Promise<GitHubCommit[]> {
   const all: GitHubCommit[] = [];
 
-  for (let page = 1; page <= MAX_PAGES; page += 1) {
+  for (let page = 1; page <= MAX_COMMIT_PAGES; page += 1) {
     const url = `${GITHUB_API}/repos/${ref.owner}/${ref.repo}/commits?since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}&per_page=100&page=${page}`;
     const pageData = await ghGet<GitHubCommit[]>(url, token);
     if (pageData.length === 0) {
@@ -347,25 +393,46 @@ export async function fetchMergedPrsForWindow(
   mergedPrs: GitHubPullRequest[];
   ciVerifiedMergedPrs: GitHubPullRequest[];
   usedDefaultBranchFallback: boolean;
+  ingestion: MergedPrIngestionMetadata;
+  ciVerification: CiVerificationMetadata;
 }> {
   const all: GitHubPullRequest[] = [];
   const { branchTargets, usedFallback } = await resolveDefaultBranchTargets(ref, token);
+  let pagesFetched = 0;
+  let truncated = false;
 
-  for (let page = 1; page <= MAX_PAGES; page += 1) {
+  const sinceMs = Date.parse(since);
+  const untilMs = Date.parse(until);
+  for (let page = 1; page <= MAX_MERGED_PR_PAGES; page += 1) {
     const url = `${GITHUB_API}/repos/${ref.owner}/${ref.repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=${page}`;
     const pageData = await ghGet<GitHubPullRequest[]>(url, token);
+    pagesFetched = page;
     if (pageData.length === 0) {
       break;
     }
 
     all.push(...pageData);
+
+    const oldestUpdatedMs = pageData.reduce((oldest, pr) => {
+      const updatedMs = Date.parse(pr.updated_at ?? '');
+      if (!Number.isFinite(updatedMs)) {
+        return oldest;
+      }
+      return Math.min(oldest, updatedMs);
+    }, Number.POSITIVE_INFINITY);
+    if (Number.isFinite(oldestUpdatedMs) && oldestUpdatedMs < sinceMs) {
+      break;
+    }
+
     if (pageData.length < 100) {
       break;
     }
+
+    if (page === MAX_MERGED_PR_PAGES) {
+      truncated = !Number.isFinite(oldestUpdatedMs) || oldestUpdatedMs >= sinceMs;
+    }
   }
 
-  const sinceMs = Date.parse(since);
-  const untilMs = Date.parse(until);
   const mergedPrs = all.filter((pr) => {
     if (!pr.merged_at || isBot(pr.user?.login)) {
       return false;
@@ -380,7 +447,8 @@ export async function fetchMergedPrsForWindow(
     return Number.isFinite(mergedMs) && mergedMs >= sinceMs && mergedMs < untilMs;
   });
 
-  const prsForVerification = mergedPrs.slice(0, MAX_CI_VERIFICATION_PRS);
+  const verificationCap = resolveCiVerificationCap(mergedPrs.length);
+  const prsForVerification = mergedPrs.slice(0, verificationCap);
   const verification = await mapWithConcurrency(prsForVerification, CI_VERIFICATION_CONCURRENCY, async (pr) => ({
     pr,
     ciVerified:
@@ -388,11 +456,25 @@ export async function fetchMergedPrsForWindow(
         ? await isMergeCommitCiVerified(ref, pr.merge_commit_sha, token)
         : false,
   }));
+  const coverageRatio = toCoverageRatio(prsForVerification.length, mergedPrs.length);
 
   return {
     mergedPrs,
     ciVerifiedMergedPrs: verification.filter((item) => item.ciVerified).map((item) => item.pr),
     usedDefaultBranchFallback: usedFallback,
+    ingestion: {
+      pagesFetched,
+      maxPages: MAX_MERGED_PR_PAGES,
+      truncated,
+    },
+    ciVerification: {
+      evaluatedPrs: prsForVerification.length,
+      totalMergedPrs: mergedPrs.length,
+      coverageRatio,
+      cap: verificationCap,
+      capped: mergedPrs.length > verificationCap,
+      confidence: inferVerificationConfidence(coverageRatio),
+    },
   };
 }
 

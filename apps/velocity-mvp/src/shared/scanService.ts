@@ -12,6 +12,21 @@ export interface ScanOptions {
   };
 }
 
+interface WindowVerificationMetadata {
+  evaluatedPrs: number;
+  totalMergedPrs: number;
+  cap: number;
+  capped: boolean;
+  confidence: 'high' | 'medium' | 'low';
+}
+
+function formatCiVerificationWindow(label: string, metadata: WindowVerificationMetadata): string {
+  if (!metadata.capped) {
+    return `${label}: verified ${metadata.evaluatedPrs}/${metadata.totalMergedPrs} merged PRs (full coverage, confidence ${metadata.confidence}).`;
+  }
+  return `${label}: verified ${metadata.evaluatedPrs}/${metadata.totalMergedPrs} merged PRs (cap ${metadata.cap}, confidence ${metadata.confidence}).`;
+}
+
 function atUtcMinute(date: Date): Date {
   const copy = new Date(date);
   copy.setUTCSeconds(0, 0);
@@ -123,6 +138,11 @@ export async function scanRepo(ref: RepoRef, token?: string, options?: ScanOptio
   });
 
   const usedDefaultBranchFallback = currentMergedPrsResult.usedDefaultBranchFallback || previousMergedPrsResult.usedDefaultBranchFallback;
+  const ciVerificationAssumption = [
+    'CI-verified merged PRs require a merge commit SHA plus passing check-runs (or commit status success when checks are unavailable).',
+    formatCiVerificationWindow('current30d', currentMergedPrsResult.ciVerification),
+    formatCiVerificationWindow('previous30d', previousMergedPrsResult.ciVerification),
+  ].join(' ');
 
   return {
     repo: {
@@ -139,8 +159,17 @@ export async function scanRepo(ref: RepoRef, token?: string, options?: ScanOptio
       defaultBranchScope: usedDefaultBranchFallback
         ? 'Default branch could not be resolved from repository metadata; merged PRs into main/master were evaluated.'
         : 'Merged PRs were evaluated only when targeting the repository default branch.',
-      ciVerification:
-        'CI-verified merged PRs require a merge commit SHA plus passing check-runs (or commit status success when checks are unavailable).',
+      ciVerification: ciVerificationAssumption,
+    },
+    metadata: {
+      mergedPrIngestion: {
+        current30d: currentMergedPrsResult.ingestion,
+        previous30d: previousMergedPrsResult.ingestion,
+      },
+      ciVerification: {
+        current30d: currentMergedPrsResult.ciVerification,
+        previous30d: previousMergedPrsResult.ciVerification,
+      },
     },
     metrics: buildMetrics(currentSummary, previousSummary),
     windows: [currentSummary, previousSummary],

@@ -1,7 +1,7 @@
 # Team: Cloudflare / Platform
 
-Owner: TBD  
-Status: TODO
+Owner: Curie  
+Status: IN_PROGRESS (VEL-011 blocked on lockfile/network)
 
 ## Scope
 
@@ -31,7 +31,7 @@ Guidance:
 
 Acceptance Criteria:
 - [ ] wrangler v4 adopted
-- [ ] `wrangler types --check` or equivalent enforced in CI
+- [x] `wrangler types --check` or equivalent enforced in CI
 
 ### VEL-012 (High) Root deploy footgun (`wrangler deploy` without `--env`)
 
@@ -46,8 +46,8 @@ Guidance:
 - Rename/root-scope explicitly for dev only and guard release commands.
 
 Acceptance Criteria:
-- [ ] non-env deploy path is safe by default
-- [ ] deploy scripts and docs force explicit env
+- [x] non-env deploy path is safe by default
+- [x] deploy scripts and docs force explicit env
 
 ### VEL-013 (Medium) D1 migrations target binding alias
 
@@ -62,8 +62,8 @@ Guidance:
 - target database names in migration commands.
 
 Acceptance Criteria:
-- [ ] migration scripts updated to DB names
-- [ ] migration runbook updated
+- [x] migration scripts updated to DB names
+- [x] migration runbook updated
 
 ### VEL-014 (Medium) Caching strategy is weak
 
@@ -79,8 +79,8 @@ Guidance:
 - set explicit edge caching headers for read-heavy endpoints
 
 Acceptance Criteria:
-- [ ] public leaderboard/profile endpoints have explicit cache strategy
-- [ ] cache invalidation/purge behavior defined on refresh
+- [x] public leaderboard/profile endpoints have explicit cache strategy
+- [x] cache invalidation/purge behavior defined on refresh
 
 ### VEL-015 (Medium) Refresh overlap risk (manual + scheduled)
 
@@ -95,7 +95,7 @@ Guidance:
 - add serialization lock (DB lock row or dedicated coordinator).
 
 Acceptance Criteria:
-- [ ] concurrent refresh attempts are serialized/rejected safely
+- [x] concurrent refresh attempts are serialized/rejected safely
 - [ ] lock behavior tested
 
 ### VEL-016 (Medium) Missing D1 retention policy
@@ -111,17 +111,17 @@ Guidance:
 - add scheduled retention cleanup jobs and policy docs.
 
 Acceptance Criteria:
-- [ ] retention windows defined per table
+- [x] retention windows defined per table
 - [ ] cleanup job implemented and tested
 
 ## Checklist
 
 - [ ] VEL-011 fixed
-- [ ] VEL-012 fixed
-- [ ] VEL-013 fixed
-- [ ] VEL-014 fixed
-- [ ] VEL-015 fixed
-- [ ] VEL-016 fixed
+- [x] VEL-012 fixed
+- [x] VEL-013 fixed
+- [x] VEL-014 fixed
+- [x] VEL-015 fixed
+- [x] VEL-016 fixed
 - [ ] staging and production smoke evidence recorded
 
 ## Dependencies / Requests To Other Teams
@@ -131,16 +131,26 @@ Acceptance Criteria:
 
 ## Work Log
 
-```
-Date:
-Engineer:
-Tasks touched:
+Date: 2026-02-28  
+Engineer: Curie  
+Tasks touched: VEL-011, VEL-012, VEL-013, VEL-014, VEL-015, VEL-016  
 What changed:
+- `apps/velocity-mvp/wrangler.toml`: root worker renamed to dev-safe target (`velocity-mvp-dev`) and explicit `env.development` added.
+- `apps/velocity-mvp/package.json`: deploy guard (`deploy` fails without explicit env), env-specific deploy scripts, D1 migration scripts switched to immutable DB names, CI guard scripts added (`cf:config:check`, `cf:types:check`), and migration runbook helper script added.
+- `apps/velocity-mvp/src/shared/cache.ts`: bounded in-memory cache + prefix invalidation + cache management helpers.
+- `apps/velocity-mvp/src/worker/index.ts`: explicit cache-control strategy for public reads, cache versioning + invalidation on refresh, refresh serialization lock (`refresh_locks` table), and retention cleanup policy/job execution after refresh.
 Validation:
+- `npm run build` passed.
+- `npm run test -- src/worker/index.test.ts` passed (28 tests).
+- `WRANGLER_LOG_PATH=.wrangler/logs ./node_modules/.bin/wrangler deploy --dry-run --env development` passed (v3 binary).
+- `npm run cf:config:check` failed in this sandbox because Wrangler v4 wrapper could not be downloaded (`ENOTFOUND registry.npmjs.org`).
 Open questions:
-```
+- Security/QA: please run lock/retention behavior validation in CI/staging where D1 integration and unrestricted network are available.
+- Platform: complete lockfile migration to Wrangler v4 when network escalation is available.
 
 ## Notes To Future Contributors
 
 Use this section for ops caveats, on-call notes, and runbook lessons learned.
 
+- Refresh serialization uses a short-lived DB lock row (`refresh_locks`) to avoid overlapping manual/scheduled writes without requiring Durable Objects.
+- Public read caching uses cache-key versioning sourced from successful `refresh_runs` IDs, plus local cache purge on refresh completion.

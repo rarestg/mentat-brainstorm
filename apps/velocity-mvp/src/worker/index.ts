@@ -3,9 +3,10 @@ import { Hono, type Context } from 'hono';
 import { z } from 'zod';
 import leaderboardArtifact from '../../data/leaderboard.generated.json';
 import seedCreators from '../../data/seed-creators.json';
+import { deleteCachedByPrefix, getCached, setCached } from '../shared/cache';
 import { exchangeGitHubOAuthCode, fetchGitHubAuthenticatedUser } from '../shared/github';
 import { scanRepoByUrl } from '../shared/scanService';
-import type { LeaderboardArtifact, ScanRequest, SeedCreator } from '../shared/types';
+import type { LeaderboardArtifact, ProfileResponse, ScanRequest, SeedCreator } from '../shared/types';
 import {
   buildBadgeSvg,
   createSessionRecord,
@@ -30,6 +31,26 @@ const OAUTH_STATE_TTL_SECONDS = 10 * 60;
 const DEFAULT_SESSION_TTL_HOURS = 24 * 14;
 const OAUTH_TOKEN_ENCRYPTION_KEY_ENV = 'OAUTH_TOKEN_ENCRYPTION_KEY';
 const OAUTH_TOKEN_CIPHERTEXT_VERSION = 'v1';
+const PUBLIC_CACHE_KEY_PREFIX = 'worker:public:';
+const PUBLIC_CACHE_VERSION_KEY = `${PUBLIC_CACHE_KEY_PREFIX}version`;
+const PUBLIC_CACHE_VERSION_TTL_MS = 15 * 1000;
+const LEADERBOARD_LOCAL_CACHE_TTL_MS = 30 * 1000;
+const PROFILE_LOCAL_CACHE_TTL_MS = 60 * 1000;
+const LEADERBOARD_CACHE_CONTROL = 'public, max-age=30, s-maxage=60, stale-while-revalidate=300';
+const PROFILE_CACHE_CONTROL = 'public, max-age=60, s-maxage=120, stale-while-revalidate=600';
+const SHARE_CACHE_CONTROL = 'public, max-age=300, s-maxage=300, stale-while-revalidate=900';
+const REFRESH_LOCK_NAME = 'seed-refresh';
+const REFRESH_LOCK_TABLE_NAME = 'refresh_locks';
+const REFRESH_LOCK_TTL_SECONDS = 15 * 60;
+const RETENTION_WINDOWS_DAYS = {
+  scans: 180,
+  snapshots: 180,
+  profileMetricsHistory: 180,
+  refreshRuns: 45,
+  sessionsRevoked: 30,
+  sessionsExpired: 7,
+  refreshLocks: 1,
+} as const;
 
 type WorkerBindings = Env & {
   GITHUB_TOKEN?: string;
@@ -187,6 +208,21 @@ function randomToken(byteLength = 32): string {
   return toBase64Url(bytes);
 }
 
+function timingSafeEqual(left: string, right: string): boolean {
+  const leftBytes = new TextEncoder().encode(left);
+  const rightBytes = new TextEncoder().encode(right);
+  const maxLength = Math.max(leftBytes.length, rightBytes.length);
+
+  let mismatch = leftBytes.length ^ rightBytes.length;
+  for (let index = 0; index < maxLength; index += 1) {
+    const leftByte = index < leftBytes.length ? leftBytes[index] : 0;
+    const rightByte = index < rightBytes.length ? rightBytes[index] : 0;
+    mismatch |= leftByte ^ rightByte;
+  }
+
+  return mismatch === 0;
+}
+
 async function hmacSha256Hex(secret: string, message: string): Promise<string> {
   const key = await crypto.subtle.importKey(
     'raw',
@@ -250,7 +286,7 @@ async function validateSignedOAuthState(sessionSecret: string, state: string): P
   }
 
   const expectedSig = await hmacSha256Hex(sessionSecret, `oauth-state:${encodedPayload}`);
-  if (expectedSig !== providedSig) {
+  if (!timingSafeEqual(expectedSig, providedSig)) {
     return { ok: false, error: 'OAuth state signature mismatch. Start again at /api/auth/github/start.' };
   }
 
@@ -299,6 +335,291 @@ function parseHandleAllowlist(raw: string | undefined): Set<string> {
       .map((entry) => entry.trim().toLowerCase())
       .filter((entry) => entry.length > 0),
   );
+}
+
+function toFiniteNumber(value: unknown, fallback = 0): number {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : fallback;
+  }
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+  return fallback;
+}
+
+function hasD1Prepare(db: D1Database | undefined): db is D1Database {
+  return Boolean(db && typeof (db as { prepare?: unknown }).prepare === 'function');
+}
+
+function getEdgeCache(): Cache | null {
+  const cache = (globalThis as { caches?: { default?: Cache } }).caches?.default;
+  return cache ?? null;
+}
+
+function applyPublicCacheHeaders(response: Response, cacheControl: string, cacheStatus: 'local-hit' | 'edge-hit' | 'miss'): Response {
+  response.headers.set('cache-control', cacheControl);
+  response.headers.set('x-velocity-cache', cacheStatus);
+  return response;
+}
+
+function buildEdgeCacheRequest(requestUrl: string, cacheVersion: number): Request {
+  const cacheUrl = new URL(requestUrl);
+  cacheUrl.hash = '';
+  cacheUrl.searchParams.set('__cv', String(cacheVersion));
+  return new Request(cacheUrl.toString(), { method: 'GET' });
+}
+
+function localPublicCacheKey(cacheVersion: number, cacheKey: string): string {
+  return `${PUBLIC_CACHE_KEY_PREFIX}${cacheVersion}:${cacheKey}`;
+}
+
+function invalidatePublicReadCaches(nextCacheVersion?: number): void {
+  deleteCachedByPrefix(PUBLIC_CACHE_KEY_PREFIX);
+  if (typeof nextCacheVersion === 'number' && Number.isFinite(nextCacheVersion) && nextCacheVersion >= 0) {
+    setCached(PUBLIC_CACHE_VERSION_KEY, Math.floor(nextCacheVersion), PUBLIC_CACHE_VERSION_TTL_MS);
+  }
+}
+
+async function resolvePublicCacheVersion(env: WorkerBindings): Promise<number> {
+  const cached = getCached<number>(PUBLIC_CACHE_VERSION_KEY);
+  if (typeof cached === 'number' && Number.isFinite(cached)) {
+    return cached;
+  }
+
+  if (!hasD1Prepare(env.DB)) {
+    return 0;
+  }
+
+  try {
+    const row = await env.DB
+      .prepare(`SELECT COALESCE(MAX(id), 0) AS version FROM refresh_runs WHERE status = 'success'`)
+      .first<{ version?: unknown }>();
+    const version = Math.max(0, toFiniteNumber(row?.version));
+    setCached(PUBLIC_CACHE_VERSION_KEY, version, PUBLIC_CACHE_VERSION_TTL_MS);
+    return version;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[cache] failed to resolve refresh-based cache version, using 0: ${message}`);
+    return 0;
+  }
+}
+
+interface CachedJsonResponseOptions<T> {
+  cacheKey: string;
+  cacheVersion: number;
+  localTtlMs: number;
+  cacheControl: string;
+  skipCache?: boolean;
+  load: () => Promise<T>;
+}
+
+async function respondWithCachedJson<T>(c: WorkerContext, options: CachedJsonResponseOptions<T>): Promise<Response> {
+  if (options.skipCache) {
+    const payload = await options.load();
+    return applyPublicCacheHeaders(c.json(payload), options.cacheControl, 'miss');
+  }
+
+  const localKey = localPublicCacheKey(options.cacheVersion, options.cacheKey);
+  const local = getCached<T>(localKey);
+  if (local !== undefined) {
+    return applyPublicCacheHeaders(c.json(local), options.cacheControl, 'local-hit');
+  }
+
+  const edgeCache = getEdgeCache();
+  const edgeRequest = buildEdgeCacheRequest(c.req.url, options.cacheVersion);
+  if (edgeCache) {
+    const edgeHit = await edgeCache.match(edgeRequest);
+    if (edgeHit) {
+      const response = new Response(edgeHit.body, edgeHit);
+      return applyPublicCacheHeaders(response, options.cacheControl, 'edge-hit');
+    }
+  }
+
+  const payload = await options.load();
+  setCached(localKey, payload, options.localTtlMs);
+  const response = applyPublicCacheHeaders(c.json(payload), options.cacheControl, 'miss');
+
+  if (edgeCache && response.ok) {
+    await edgeCache.put(edgeRequest, response.clone());
+  }
+  return response;
+}
+
+class ProfileNotFoundError extends Error {
+  constructor(handle: string) {
+    super(`Profile not found for handle: ${handle}`);
+    this.name = 'ProfileNotFoundError';
+  }
+}
+
+async function loadProfileByHandle(db: D1Database, handle: string): Promise<ProfileResponse> {
+  await ensureSeedData(db, leaderboardArtifact as LeaderboardArtifact);
+  const profile = await getProfileByHandle(db, handle);
+  if (!profile) {
+    throw new ProfileNotFoundError(handle);
+  }
+  return profile;
+}
+
+interface RefreshLockRow {
+  lock_owner: string;
+  expires_at: string;
+}
+
+interface RefreshLockTicket {
+  ownerId: string;
+}
+
+class RefreshLockConflictError extends Error {
+  lockOwner: string | null;
+  expiresAt: string | null;
+
+  constructor(lockOwner: string | null, expiresAt: string | null) {
+    super('Seed refresh is already running.');
+    this.name = 'RefreshLockConflictError';
+    this.lockOwner = lockOwner;
+    this.expiresAt = expiresAt;
+  }
+}
+
+async function ensureRefreshLockTable(db: D1Database): Promise<void> {
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS ${REFRESH_LOCK_TABLE_NAME} (
+        lock_name TEXT PRIMARY KEY,
+        lock_owner TEXT NOT NULL,
+        acquired_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      )`,
+    )
+    .run();
+  await db.prepare(`CREATE INDEX IF NOT EXISTS idx_refresh_locks_expires ON ${REFRESH_LOCK_TABLE_NAME}(expires_at)`).run();
+}
+
+async function readCurrentRefreshLock(db: D1Database): Promise<RefreshLockRow | null> {
+  return db
+    .prepare(`SELECT lock_owner, expires_at FROM ${REFRESH_LOCK_TABLE_NAME} WHERE lock_name = ? LIMIT 1`)
+    .bind(REFRESH_LOCK_NAME)
+    .first<RefreshLockRow>();
+}
+
+async function acquireRefreshLock(db: D1Database, trigger: 'manual' | 'scheduled'): Promise<RefreshLockTicket | null> {
+  await ensureRefreshLockTable(db);
+  const ownerId = `${trigger}:${crypto.randomUUID()}`;
+  const acquiredAt = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + REFRESH_LOCK_TTL_SECONDS * 1000).toISOString();
+
+  const result = await db
+    .prepare(
+      `INSERT INTO ${REFRESH_LOCK_TABLE_NAME} (lock_name, lock_owner, acquired_at, expires_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(lock_name) DO UPDATE SET
+         lock_owner = excluded.lock_owner,
+         acquired_at = excluded.acquired_at,
+         expires_at = excluded.expires_at
+       WHERE datetime(${REFRESH_LOCK_TABLE_NAME}.expires_at) <= datetime('now')`,
+    )
+    .bind(REFRESH_LOCK_NAME, ownerId, acquiredAt, expiresAt)
+    .run();
+
+  const changes = toFiniteNumber((result as { meta?: { changes?: unknown } }).meta?.changes);
+  if (changes < 1) {
+    return null;
+  }
+  return { ownerId };
+}
+
+async function releaseRefreshLock(db: D1Database, ownerId: string): Promise<void> {
+  await db
+    .prepare(`DELETE FROM ${REFRESH_LOCK_TABLE_NAME} WHERE lock_name = ? AND lock_owner = ?`)
+    .bind(REFRESH_LOCK_NAME, ownerId)
+    .run();
+}
+
+interface RetentionCleanupResult {
+  executedAt: string;
+  policyDays: typeof RETENTION_WINDOWS_DAYS;
+  deletedRows: {
+    scans: number;
+    snapshots: number;
+    profileMetricsHistory: number;
+    refreshRuns: number;
+    sessions: number;
+    refreshLocks: number;
+  };
+}
+
+async function runRetentionCleanup(db: D1Database): Promise<RetentionCleanupResult> {
+  const scansWindow = `-${RETENTION_WINDOWS_DAYS.scans} day`;
+  const snapshotsWindow = `-${RETENTION_WINDOWS_DAYS.snapshots} day`;
+  const historyWindow = `-${RETENTION_WINDOWS_DAYS.profileMetricsHistory} day`;
+  const refreshRunsWindow = `-${RETENTION_WINDOWS_DAYS.refreshRuns} day`;
+  const revokedSessionsWindow = `-${RETENTION_WINDOWS_DAYS.sessionsRevoked} day`;
+  const expiredSessionsWindow = `-${RETENTION_WINDOWS_DAYS.sessionsExpired} day`;
+  const refreshLocksWindow = `-${RETENTION_WINDOWS_DAYS.refreshLocks} day`;
+
+  const scansDelete = await db
+    .prepare(
+      `DELETE FROM scans
+       WHERE snapshot_id IN (
+         SELECT id FROM snapshots
+         WHERE datetime(scanned_at) < datetime('now', ?)
+       )`,
+    )
+    .bind(scansWindow)
+    .run();
+
+  const snapshotsDelete = await db
+    .prepare(`DELETE FROM snapshots WHERE datetime(scanned_at) < datetime('now', ?)`)
+    .bind(snapshotsWindow)
+    .run();
+
+  const historyDelete = await db
+    .prepare(`DELETE FROM profile_metrics_history WHERE datetime(captured_at) < datetime('now', ?)`)
+    .bind(historyWindow)
+    .run();
+
+  const refreshRunsDelete = await db
+    .prepare(
+      `DELETE FROM refresh_runs
+       WHERE status <> 'running'
+         AND datetime(COALESCE(finished_at, started_at)) < datetime('now', ?)`,
+    )
+    .bind(refreshRunsWindow)
+    .run();
+
+  const sessionsDelete = await db
+    .prepare(
+      `DELETE FROM sessions
+       WHERE (revoked_at IS NOT NULL AND datetime(revoked_at) < datetime('now', ?))
+          OR (revoked_at IS NULL AND datetime(expires_at) < datetime('now', ?))`,
+    )
+    .bind(revokedSessionsWindow, expiredSessionsWindow)
+    .run();
+
+  const refreshLocksDelete = await db
+    .prepare(`DELETE FROM ${REFRESH_LOCK_TABLE_NAME} WHERE datetime(expires_at) < datetime('now', ?)`)
+    .bind(refreshLocksWindow)
+    .run();
+
+  return {
+    executedAt: new Date().toISOString(),
+    policyDays: RETENTION_WINDOWS_DAYS,
+    deletedRows: {
+      scans: toFiniteNumber((scansDelete as { meta?: { changes?: unknown } }).meta?.changes),
+      snapshots: toFiniteNumber((snapshotsDelete as { meta?: { changes?: unknown } }).meta?.changes),
+      profileMetricsHistory: toFiniteNumber((historyDelete as { meta?: { changes?: unknown } }).meta?.changes),
+      refreshRuns: toFiniteNumber((refreshRunsDelete as { meta?: { changes?: unknown } }).meta?.changes),
+      sessions: toFiniteNumber((sessionsDelete as { meta?: { changes?: unknown } }).meta?.changes),
+      refreshLocks: toFiniteNumber((refreshLocksDelete as { meta?: { changes?: unknown } }).meta?.changes),
+    },
+  };
+}
+
+interface SeedRefreshExecutionResult {
+  refresh: Awaited<ReturnType<typeof refreshLeaderboardFromSeed>>;
+  retention: RetentionCleanupResult | null;
 }
 
 async function requireAuthenticatedSession(c: WorkerContext): Promise<SessionAuthResult> {
@@ -355,28 +676,137 @@ async function requireAuthenticatedSession(c: WorkerContext): Promise<SessionAut
   };
 }
 
+async function resolveOptionalSessionIdentity(c: WorkerContext): Promise<AuthSessionIdentity | null> {
+  if (!c.env?.DB) {
+    return null;
+  }
+
+  const sessionSecret = c.env.SESSION_SECRET;
+  if (typeof sessionSecret !== 'string' || sessionSecret.trim().length === 0) {
+    return null;
+  }
+
+  const sessionToken = getCookie(c, SESSION_COOKIE_NAME);
+  if (!sessionToken) {
+    return null;
+  }
+
+  try {
+    const tokenHash = await hashSessionToken(sessionSecret, sessionToken);
+    const identity = await getSessionIdentityByTokenHash(c.env.DB, tokenHash);
+    if (!identity) {
+      deleteCookie(c, SESSION_COOKIE_NAME, { path: '/' });
+      return null;
+    }
+    return identity;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[scan] optional auth lookup failed: ${message}`);
+    return null;
+  }
+}
+
 async function runSeedRefresh(env: WorkerBindings, trigger: 'manual' | 'scheduled') {
   if (!env.DB) {
     throw new Error('DB binding is required for seed refresh operations.');
   }
 
-  return refreshLeaderboardFromSeed(env.DB, seedCreators as SeedCreator[], env.GITHUB_TOKEN, trigger);
+  if (!hasD1Prepare(env.DB)) {
+    const refresh = await refreshLeaderboardFromSeed(env.DB, seedCreators as SeedCreator[], env.GITHUB_TOKEN, trigger);
+    invalidatePublicReadCaches(refresh.runId);
+    return { refresh, retention: null } satisfies SeedRefreshExecutionResult;
+  }
+
+  const ticket = await acquireRefreshLock(env.DB, trigger);
+  if (!ticket) {
+    const active = await readCurrentRefreshLock(env.DB);
+    throw new RefreshLockConflictError(active?.lock_owner ?? null, active?.expires_at ?? null);
+  }
+
+  try {
+    const refresh = await refreshLeaderboardFromSeed(env.DB, seedCreators as SeedCreator[], env.GITHUB_TOKEN, trigger);
+    invalidatePublicReadCaches(refresh.runId);
+
+    let retention: RetentionCleanupResult | null = null;
+    try {
+      retention = await runRetentionCleanup(env.DB);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[retention] cleanup failed after ${trigger} refresh: ${message}`);
+    }
+
+    return { refresh, retention } satisfies SeedRefreshExecutionResult;
+  } finally {
+    try {
+      await releaseRefreshLock(env.DB, ticket.ownerId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[refresh] failed to release lock owner=${ticket.ownerId}: ${message}`);
+    }
+  }
 }
 
 app.get('/api/health', (c) => {
   return c.json({ ok: true, service: 'velocity-mvp', now: new Date().toISOString() });
 });
 
-app.get('/api/leaderboard', (c) => {
+app.get('/api/leaderboard', async (c) => {
   const db = c.env?.DB;
   if (!db) {
-    return c.json(leaderboardArtifact as LeaderboardArtifact);
+    return applyPublicCacheHeaders(
+      c.json({
+        ...(leaderboardArtifact as LeaderboardArtifact),
+        dataSource: {
+          kind: 'static-artifact',
+          fallback: true,
+          healthy: false,
+          reason: 'db-binding-missing',
+        },
+      }),
+      LEADERBOARD_CACHE_CONTROL,
+      'miss',
+    );
   }
 
-  return ensureSeedData(db, leaderboardArtifact as LeaderboardArtifact)
-    .then(() => getLeaderboardArtifact(db))
-    .then((artifact) => c.json(artifact))
-    .catch(() => c.json(leaderboardArtifact as LeaderboardArtifact));
+  const cacheVersion = await resolvePublicCacheVersion(c.env);
+  try {
+    return await respondWithCachedJson(c, {
+      cacheKey: 'leaderboard',
+      cacheVersion,
+      localTtlMs: LEADERBOARD_LOCAL_CACHE_TTL_MS,
+      cacheControl: LEADERBOARD_CACHE_CONTROL,
+      skipCache: !hasD1Prepare(db),
+      load: async () => {
+        await ensureSeedData(db, leaderboardArtifact as LeaderboardArtifact);
+        const artifact = await getLeaderboardArtifact(db);
+        return {
+          ...artifact,
+          dataSource: {
+            kind: 'd1',
+            fallback: false,
+            healthy: true,
+          },
+        };
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown leaderboard data failure';
+    console.error(`[leaderboard] failed to read D1 artifact; serving fallback: ${message}`);
+    return c.json(
+      {
+        ...(leaderboardArtifact as LeaderboardArtifact),
+        dataSource: {
+          kind: 'static-artifact',
+          fallback: true,
+          healthy: false,
+          reason: 'd1-read-failure',
+          message,
+        },
+      },
+      200,
+      { 'cache-control': 'no-store' },
+    );
+  }
 });
 
 app.post('/api/scan', async (c) => {
@@ -393,10 +823,54 @@ app.post('/api/scan', async (c) => {
 
   try {
     const report = await scanRepoByUrl(parsed.data.repoUrl, c.env?.GITHUB_TOKEN);
+    let persistence:
+      | {
+          canonicalLeaderboardWrite: true;
+          reason: 'persisted';
+          ownerHandle: string;
+          actorHandle: string;
+        }
+      | {
+          canonicalLeaderboardWrite: false;
+          reason: 'db-unavailable' | 'unauthenticated' | 'owner-mismatch';
+          ownerHandle: string;
+          actorHandle?: string;
+        } = {
+      canonicalLeaderboardWrite: false,
+      reason: c.env?.DB ? 'unauthenticated' : 'db-unavailable',
+      ownerHandle: report.repo.owner.toLowerCase(),
+    };
+
     if (c.env?.DB) {
-      await persistScanReport(c.env.DB, report);
+      const identity = await resolveOptionalSessionIdentity(c);
+      const ownerHandle = report.repo.owner.trim().toLowerCase();
+      if (!identity) {
+        persistence = {
+          canonicalLeaderboardWrite: false,
+          reason: 'unauthenticated',
+          ownerHandle,
+        };
+      } else if (identity.handle.trim().toLowerCase() !== ownerHandle) {
+        persistence = {
+          canonicalLeaderboardWrite: false,
+          reason: 'owner-mismatch',
+          ownerHandle,
+          actorHandle: identity.handle,
+        };
+      } else {
+        await persistScanReport(c.env.DB, report);
+        persistence = {
+          canonicalLeaderboardWrite: true,
+          reason: 'persisted',
+          ownerHandle,
+          actorHandle: identity.handle,
+        };
+      }
     }
-    return c.json(report);
+    return c.json({
+      ...report,
+      persistence,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown scan error';
     const status = message.startsWith('Invalid repository URL:') ? 400 : 500;
@@ -466,7 +940,7 @@ app.get('/api/auth/github/callback', async (c) => {
   }
 
   const stateCookie = getCookie(c, OAUTH_STATE_COOKIE_NAME);
-  if (!stateCookie || stateCookie !== state) {
+  if (!stateCookie || !timingSafeEqual(stateCookie, state)) {
     return c.json(
       {
         error: 'OAuth state cookie mismatch.',
@@ -680,16 +1154,36 @@ app.post('/api/refresh/seeds', async (c) => {
   }
 
   try {
-    const refresh = await runSeedRefresh(c.env, 'manual');
+    const execution = await runSeedRefresh(c.env, 'manual');
     return c.json({
       ok: true,
       trigger: 'manual',
       triggeredBy: auth.identity.handle,
-      refresh,
+      refresh: execution.refresh,
+      retentionCleanup: execution.retention,
+      cacheInvalidation: {
+        localCachePurged: true,
+        cacheVersion: execution.refresh.runId,
+        edgeStrategy: 'Cache key versioning + short edge TTL',
+      },
       productionReady: true,
       placeholder: false,
     });
   } catch (error) {
+    if (error instanceof RefreshLockConflictError) {
+      return c.json(
+        {
+          error: 'Refresh already in progress',
+          actionable: 'Retry once the active refresh lock expires or completes.',
+          lock: {
+            owner: error.lockOwner,
+            expiresAt: error.expiresAt,
+          },
+        },
+        409,
+      );
+    }
+
     const message = error instanceof Error ? error.message : 'Unknown seed refresh error';
     return c.json(
       {
@@ -706,12 +1200,26 @@ app.get('/api/profile/:handle', async (c) => {
     return c.json({ error: 'Profile storage unavailable' }, 503);
   }
 
-  await ensureSeedData(c.env.DB, leaderboardArtifact as LeaderboardArtifact);
-  const profile = await getProfileByHandle(c.env.DB, c.req.param('handle'));
-  if (!profile) {
-    return c.json({ error: 'Profile not found' }, 404);
+  const handle = c.req.param('handle').trim().toLowerCase();
+  const cacheVersion = await resolvePublicCacheVersion(c.env);
+
+  try {
+    return await respondWithCachedJson(c, {
+      cacheKey: `profile:${handle}`,
+      cacheVersion,
+      localTtlMs: PROFILE_LOCAL_CACHE_TTL_MS,
+      cacheControl: PROFILE_CACHE_CONTROL,
+      skipCache: !hasD1Prepare(c.env.DB),
+      load: async () => loadProfileByHandle(c.env.DB as D1Database, handle),
+    });
+  } catch (error) {
+    if (error instanceof ProfileNotFoundError) {
+      return c.json({ error: 'Profile not found' }, 404, { 'cache-control': 'public, max-age=30, s-maxage=30' });
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[profile] failed to load handle=${handle}: ${message}`);
+    return c.json({ error: 'Profile lookup failed' }, 500);
   }
-  return c.json(profile);
 });
 
 app.get('/api/v/:handle', async (c) => {
@@ -719,12 +1227,26 @@ app.get('/api/v/:handle', async (c) => {
     return c.json({ error: 'Profile storage unavailable' }, 503);
   }
 
-  await ensureSeedData(c.env.DB, leaderboardArtifact as LeaderboardArtifact);
-  const profile = await getProfileByHandle(c.env.DB, c.req.param('handle'));
-  if (!profile) {
-    return c.json({ error: 'Profile not found' }, 404);
+  const handle = c.req.param('handle').trim().toLowerCase();
+  const cacheVersion = await resolvePublicCacheVersion(c.env);
+
+  try {
+    return await respondWithCachedJson(c, {
+      cacheKey: `profile:${handle}`,
+      cacheVersion,
+      localTtlMs: PROFILE_LOCAL_CACHE_TTL_MS,
+      cacheControl: PROFILE_CACHE_CONTROL,
+      skipCache: !hasD1Prepare(c.env.DB),
+      load: async () => loadProfileByHandle(c.env.DB as D1Database, handle),
+    });
+  } catch (error) {
+    if (error instanceof ProfileNotFoundError) {
+      return c.json({ error: 'Profile not found' }, 404, { 'cache-control': 'public, max-age=30, s-maxage=30' });
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[profile] failed to load /api/v handle=${handle}: ${message}`);
+    return c.json({ error: 'Profile lookup failed' }, 500);
   }
-  return c.json(profile);
 });
 
 app.get('/api/share/:handle/badge.svg', async (c) => {
@@ -732,15 +1254,21 @@ app.get('/api/share/:handle/badge.svg', async (c) => {
     return c.text('Profile storage unavailable', 503);
   }
 
-  await ensureSeedData(c.env.DB, leaderboardArtifact as LeaderboardArtifact);
-  const profile = await getProfileByHandle(c.env.DB, c.req.param('handle'));
-  if (!profile) {
-    return c.text('Profile not found', 404);
+  let profile: ProfileResponse;
+  try {
+    profile = await loadProfileByHandle(c.env.DB, c.req.param('handle'));
+  } catch (error) {
+    if (error instanceof ProfileNotFoundError) {
+      return c.text('Profile not found', 404);
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[share] badge generation failed: ${message}`);
+    return c.text('Profile lookup failed', 500);
   }
 
   return c.body(buildBadgeSvg(profile), 200, {
     'content-type': 'image/svg+xml; charset=utf-8',
-    'cache-control': 'public, max-age=300',
+    'cache-control': SHARE_CACHE_CONTROL,
   });
 });
 
@@ -749,13 +1277,19 @@ app.get('/api/share/:handle/stat-card.json', async (c) => {
     return c.json({ error: 'Profile storage unavailable' }, 503);
   }
 
-  await ensureSeedData(c.env.DB, leaderboardArtifact as LeaderboardArtifact);
-  const profile = await getProfileByHandle(c.env.DB, c.req.param('handle'));
-  if (!profile) {
-    return c.json({ error: 'Profile not found' }, 404);
+  let profile: ProfileResponse;
+  try {
+    profile = await loadProfileByHandle(c.env.DB, c.req.param('handle'));
+  } catch (error) {
+    if (error instanceof ProfileNotFoundError) {
+      return c.json({ error: 'Profile not found' }, 404);
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[share] stat-card generation failed: ${message}`);
+    return c.json({ error: 'Profile lookup failed' }, 500);
   }
 
-  c.header('cache-control', 'public, max-age=300');
+  c.header('cache-control', SHARE_CACHE_CONTROL);
   return c.json({
     version: 'v1',
     generatedAt: new Date().toISOString(),
@@ -812,10 +1346,20 @@ const worker: ExportedHandler<WorkerBindings> = {
   scheduled(_controller, env, ctx) {
     ctx.waitUntil(
       runSeedRefresh(env, 'scheduled')
-        .then((result) => {
-          console.log(`[refresh] scheduled seed refresh complete run=${result.runId} entries=${result.entriesProcessed}`);
+        .then((execution) => {
+          const refresh = execution.refresh;
+          const retentionSummary = execution.retention
+            ? ` retention_deleted=${JSON.stringify(execution.retention.deletedRows)}`
+            : '';
+          console.log(
+            `[refresh] scheduled seed refresh complete run=${refresh.runId} entries=${refresh.entriesProcessed}${retentionSummary}`,
+          );
         })
         .catch((error) => {
+          if (error instanceof RefreshLockConflictError) {
+            console.log(`[refresh] scheduled seed refresh skipped; lock held by ${error.lockOwner ?? 'unknown'}`);
+            return;
+          }
           const message = error instanceof Error ? error.message : String(error);
           console.error(`[refresh] scheduled seed refresh failed: ${message}`);
         }),

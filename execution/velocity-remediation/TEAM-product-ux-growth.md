@@ -1,7 +1,7 @@
 # Team: Product / UX / Growth
 
-Owner: TBD  
-Status: TODO
+Owner: Hegel  
+Status: IN_PROGRESS
 
 ## Scope
 
@@ -33,9 +33,9 @@ Guidance:
   - compare against selected developer
 
 Acceptance Criteria:
-- [ ] post-scan screen includes clear next action toward leaderboard participation
-- [ ] signed-out and signed-in paths both supported
-- [ ] conversion metrics instrumented
+- [x] post-scan screen includes clear next action toward leaderboard participation
+- [x] signed-out and signed-in paths both supported
+- [x] conversion metrics instrumented
 
 ### VEL-007 (High) Virality mechanics are not first-class
 
@@ -51,9 +51,9 @@ Guidance:
 - Add one-click “challenge @handle”.
 
 Acceptance Criteria:
-- [ ] visible share action on profile and leaderboard row
-- [ ] challenge link generation implemented
-- [ ] outbound traffic events tracked
+- [x] visible share action on profile and leaderboard row
+- [x] challenge link generation implemented
+- [x] outbound traffic events tracked
 
 ### VEL-008 (High) Placeholder/synthetic blocks undermine trust
 
@@ -70,8 +70,8 @@ Guidance:
 - Use provenance labels on every metric block.
 
 Acceptance Criteria:
-- [ ] no synthetic value presented as authoritative metric
-- [ ] each key module shows data source/provenance
+- [x] no synthetic value presented as authoritative metric
+- [x] each key module shows data source/provenance
 
 ### VEL-009 (High) Weak return loop (not sticky yet)
 
@@ -88,8 +88,8 @@ Guidance:
   - weekly compare snapshots
 
 Acceptance Criteria:
-- [ ] at least one weekly re-engagement mechanic shipped
-- [ ] “what changed since last visit” section on profile
+- [x] at least one weekly re-engagement mechanic shipped
+- [x] “what changed since last visit” section on profile
 
 ### VEL-010 (Medium) UX clarity gaps: loading + mobile comparisons
 
@@ -105,16 +105,16 @@ Guidance:
 - compact but comparable mobile metric set
 
 Acceptance Criteria:
-- [ ] no false negative profile state during fetch
-- [ ] mobile cards include enough comparison signal to rank users meaningfully
+- [x] no false negative profile state during fetch
+- [x] mobile cards include enough comparison signal to rank users meaningfully
 
 ## Checklist
 
-- [ ] VEL-006 fixed
-- [ ] VEL-007 fixed
-- [ ] VEL-008 fixed
-- [ ] VEL-009 fixed
-- [ ] VEL-010 fixed
+- [x] VEL-006 fixed
+- [x] VEL-007 fixed
+- [x] VEL-008 fixed
+- [x] VEL-009 fixed
+- [x] VEL-010 fixed
 - [ ] desktop + mobile UX QA complete
 
 ## Dependencies / Requests To Other Teams
@@ -124,16 +124,13 @@ Acceptance Criteria:
 
 ## Work Log
 
-```
-Date:
-Engineer:
-Tasks touched:
-What changed:
-Validation:
-Open questions:
-```
+Date: 2026-02-28  
+Engineer: Hegel  
+Tasks touched: VEL-006, VEL-007, VEL-008, VEL-009, VEL-010  
+What changed: Added post-scan conversion lane (claim/sign-in, ranking impact preview, compare target), made share/challenge/invite first-class in home/profile/leaderboard rows, removed synthetic trend/heatmap/insight fallbacks in favor of explicit unavailable states with provenance, added weekly streak + “what changed since last visit” profile modules, fixed profile loading false-negative and expanded mobile cards with rank-comparison signals.  
+Validation: `npm run lint -- src/client/App.tsx` (pass), `npm run build` (pass).  
+Open questions: Backend/Data follow-up needed to supply authoritative trend/heatmap/insight payloads and explicit provenance fields so unavailable modules can become fully populated.
 
 ## Notes To Future Contributors
 
 Use this section for copy decisions, design rationale, and deferred UX explorations.
-

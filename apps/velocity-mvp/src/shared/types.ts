@@ -38,6 +38,44 @@ export interface RepoReportCard {
     defaultBranchScope: string;
     ciVerification: string;
   };
+  metadata?: {
+    mergedPrIngestion: {
+      current30d: {
+        pagesFetched: number;
+        maxPages: number;
+        truncated: boolean;
+      };
+      previous30d: {
+        pagesFetched: number;
+        maxPages: number;
+        truncated: boolean;
+      };
+    };
+    ciVerification: {
+      current30d: {
+        evaluatedPrs: number;
+        totalMergedPrs: number;
+        coverageRatio: number;
+        cap: number;
+        capped: boolean;
+        confidence: 'high' | 'medium' | 'low';
+      };
+      previous30d: {
+        evaluatedPrs: number;
+        totalMergedPrs: number;
+        coverageRatio: number;
+        cap: number;
+        capped: boolean;
+        confidence: 'high' | 'medium' | 'low';
+      };
+    };
+  };
+  persistence?: {
+    canonicalLeaderboardWrite: boolean;
+    reason: 'db-unavailable' | 'unauthenticated' | 'owner-mismatch' | 'persisted';
+    ownerHandle: string;
+    actorHandle?: string;
+  };
   metrics: VelocityMetrics;
   windows: ScanWindowSummary[];
 }
@@ -112,6 +150,13 @@ export interface LeaderboardEntry {
 export interface LeaderboardArtifact {
   generatedAt: string;
   sourceSeedPath: string;
+  dataSource?: {
+    kind: 'd1' | 'static-artifact';
+    fallback: boolean;
+    healthy: boolean;
+    reason?: string;
+    message?: string;
+  };
   attributionPolicy?: {
     seededLeaderboardDefaultMode: 'handle-authored';
     seededLeaderboardStrict: true;
@@ -174,6 +219,7 @@ export interface GitHubPullRequest {
     type: string;
   } | null;
   merged_at: string | null;
+  updated_at?: string;
   base: {
     ref: string;
   };

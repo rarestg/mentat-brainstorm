@@ -1,4 +1,4 @@
-name = "velocity-mvp"
+name = "velocity-mvp-dev"
 main = "src/worker/index.ts"
 compatibility_date = "2026-02-27"
 workers_dev = true
@@ -21,6 +21,21 @@ migrations_dir = "migrations"
 [observability]
 enabled = true
 head_sampling_rate = 1
+
+[env.development]
+name = "velocity-mvp-dev"
+workers_dev = true
+
+[env.development.vars]
+APP_ENV = "development"
+SESSION_TTL_HOURS = "336"
+REFRESH_ADMIN_HANDLES = ""
+
+[[env.development.d1_databases]]
+binding = "DB"
+database_name = "velocity-mvp-dev"
+database_id = "8c3ad569-02c1-4b5f-90c4-32d7c96f63e6"
+migrations_dir = "migrations"
 
 [env.staging]
 name = "velocity-mvp-staging"

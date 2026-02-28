@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { fetchAuthIdentity, fetchLeaderboard, fetchProfile, logoutAuthSession, scanRepository } from './api';
 import type { AuthIdentity } from './api';
 import type { LeaderboardArtifact, LeaderboardEntry, ProfileResponse, RepoReportCard } from '../shared/types';
@@ -9,9 +9,22 @@ type Route =
   | { kind: 'home' }
   | { kind: 'profile'; handle: string };
 
+type TelemetryValue = string | number | boolean | null;
+
+interface ProfileVisitSnapshot {
+  capturedAt: string;
+  rank: number;
+  percentile: number;
+  equivalentEngineeringHours: number;
+  mergedPrsCiVerified: number;
+  weeklyStreak: number;
+}
+
 const TREND_CHART_WIDTH = 440;
 const TREND_CHART_HEIGHT = 144;
 const TREND_CHART_PADDING = 14;
+const UX_EVENT_STORAGE_KEY = 'mentat.velocity.ux.events';
+const PROFILE_VISIT_STORAGE_KEY_PREFIX = 'mentat.velocity.profile.lastVisit.';
 
 function formatPercent(v: number): string {
   return `${(v * 100).toFixed(0)}%`;
@@ -30,6 +43,144 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
+function sanitizeTelemetryValue(value: unknown): TelemetryValue {
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return value;
+  }
+  return null;
+}
+
+function trackUxEvent(event: string, payload: Record<string, unknown> = {}): void {
+  const detail = {
+    event,
+    at: new Date().toISOString(),
+    payload: Object.fromEntries(Object.entries(payload).map(([key, value]) => [key, sanitizeTelemetryValue(value)])),
+  };
+
+  const globalScope = window as Window & {
+    dataLayer?: unknown[];
+    __MENTAT_VELOCITY_EVENTS__?: unknown[];
+  };
+
+  if (Array.isArray(globalScope.dataLayer)) {
+    globalScope.dataLayer.push({
+      event: `mentat_velocity_${event}`,
+      ...detail.payload,
+    });
+  }
+
+  if (!Array.isArray(globalScope.__MENTAT_VELOCITY_EVENTS__)) {
+    globalScope.__MENTAT_VELOCITY_EVENTS__ = [];
+  }
+  globalScope.__MENTAT_VELOCITY_EVENTS__.push(detail);
+
+  try {
+    const existingRaw = window.localStorage.getItem(UX_EVENT_STORAGE_KEY);
+    const existing = existingRaw ? (JSON.parse(existingRaw) as unknown) : [];
+    const normalized = Array.isArray(existing) ? existing.slice(-119) : [];
+    normalized.push(detail);
+    window.localStorage.setItem(UX_EVENT_STORAGE_KEY, JSON.stringify(normalized));
+  } catch {
+    // Storage failures should not interrupt user actions.
+  }
+
+  window.dispatchEvent(new CustomEvent('mentat:velocity:ux-event', { detail }));
+}
+
+function toProfileVisitStorageKey(handle: string): string {
+  return `${PROFILE_VISIT_STORAGE_KEY_PREFIX}${handle.toLowerCase()}`;
+}
+
+function getStoredProfileVisit(handle: string): ProfileVisitSnapshot | null {
+  try {
+    const raw = window.localStorage.getItem(toProfileVisitStorageKey(handle));
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw) as Partial<ProfileVisitSnapshot>;
+    if (
+      typeof parsed.capturedAt !== 'string' ||
+      typeof parsed.rank !== 'number' ||
+      typeof parsed.percentile !== 'number' ||
+      typeof parsed.equivalentEngineeringHours !== 'number' ||
+      typeof parsed.mergedPrsCiVerified !== 'number' ||
+      typeof parsed.weeklyStreak !== 'number'
+    ) {
+      return null;
+    }
+    return parsed as ProfileVisitSnapshot;
+  } catch {
+    return null;
+  }
+}
+
+function setStoredProfileVisit(handle: string, snapshot: ProfileVisitSnapshot): void {
+  try {
+    window.localStorage.setItem(toProfileVisitStorageKey(handle), JSON.stringify(snapshot));
+  } catch {
+    // Storage failures should not block profile rendering.
+  }
+}
+
+function daysBetweenTimestamps(fromIso: string, toIso: string): number | null {
+  const from = Date.parse(fromIso);
+  const to = Date.parse(toIso);
+  if (!Number.isFinite(from) || !Number.isFinite(to)) {
+    return null;
+  }
+  return Math.floor(Math.abs(to - from) / (1000 * 60 * 60 * 24));
+}
+
+function computeWeeklyStreak(previous: ProfileVisitSnapshot | null, nowIso: string): number {
+  if (!previous) {
+    return 1;
+  }
+  const daysSince = daysBetweenTimestamps(previous.capturedAt, nowIso);
+  if (daysSince === null) {
+    return 1;
+  }
+  if (daysSince >= 5 && daysSince <= 9) {
+    return previous.weeklyStreak + 1;
+  }
+  if (daysSince < 5) {
+    return previous.weeklyStreak;
+  }
+  return 1;
+}
+
+function buildProfileUrl(origin: string, handle: string): string {
+  return `${origin}/v/${encodeURIComponent(handle.toLowerCase())}`;
+}
+
+function buildChallengeLink(origin: string, challengerHandle: string, targetHandle: string): string {
+  return `${buildProfileUrl(origin, challengerHandle)}?challenge=${encodeURIComponent(targetHandle.toLowerCase())}`;
+}
+
+function buildTweetIntentUrl(text: string, url: string): string {
+  const params = new URLSearchParams({ text, url });
+  return `https://twitter.com/intent/tweet?${params.toString()}`;
+}
+
+function buildInviteIntentUrl(origin: string): string {
+  return buildTweetIntentUrl('Track AI-verified throughput and challenge me on Mentat Velocity.', `${origin}/`);
+}
+
+function formatSignedDelta(value: number, maxFractionDigits = 1): string {
+  const sign = value > 0 ? '+' : '';
+  return `${sign}${formatNumber(value, maxFractionDigits)}`;
+}
+
+function formatRankDelta(previousRank: number, currentRank: number): string {
+  const movement = previousRank - currentRank;
+  if (movement > 0) {
+    return `+${movement}`;
+  }
+  if (movement < 0) {
+    return `${movement}`;
+  }
+  return '0';
+}
+
 function parseRoute(pathname: string): Route {
   const profileMatch = pathname.match(/^\/v\/([A-Za-z0-9_.-]+)\/?$/);
   if (profileMatch) {
@@ -43,10 +194,6 @@ function routeToPath(route: Route): string {
     return `/v/${route.handle}`;
   }
   return '/';
-}
-
-function hashHandle(handle: string): number {
-  return Array.from(handle).reduce((sum, char, index) => sum + char.charCodeAt(0) * (index + 1), 0);
 }
 
 function getPercentile(entry: LeaderboardEntry, totalEntries: number): number {
@@ -86,28 +233,7 @@ function buildTrendPoints(entry: LeaderboardEntry): number[] {
   if (Array.isArray(profileTrend) && profileTrend.length >= 2) {
     return profileTrend.map((value) => Math.max(0, value));
   }
-
-  // TODO(api): replace this synthesized series with backend-provided per-day points for richer chart fidelity.
-  const previousTotal = entry.repos.reduce((sum, repo) => {
-    const window = repo.windows.find((item) => item.label === 'previous30d');
-    return sum + (window?.equivalentEngineeringHours ?? 0);
-  }, 0);
-  const currentTotal = entry.repos.reduce((sum, repo) => {
-    const window = repo.windows.find((item) => item.label === 'current30d');
-    return sum + (window?.equivalentEngineeringHours ?? 0);
-  }, 0);
-
-  const baseline = previousTotal > 0 || currentTotal > 0 ? previousTotal : Math.max(entry.totals.equivalentEngineeringHours * 0.85, 0.5);
-  const target = currentTotal > 0 || previousTotal > 0 ? currentTotal : Math.max(entry.totals.equivalentEngineeringHours, 0.9);
-  const wobbleUnit = Math.max(target, baseline, 1) * 0.05;
-  const seed = hashHandle(entry.handle);
-
-  return Array.from({ length: 10 }, (_, index) => {
-    const progress = index / 9;
-    const trend = baseline + (target - baseline) * progress;
-    const wobble = Math.sin(seed * 0.11 + index * 0.9) * wobbleUnit;
-    return Math.max(0, Math.round((trend + wobble) * 10) / 10);
-  });
+  return [];
 }
 
 function buildTrendPointsFromHistory(profile: ProfileResponse): number[] {
@@ -133,16 +259,7 @@ function buildThroughputHeatmap(entry: LeaderboardEntry): number[][] {
   if (isValidHeatmapMatrix(existing)) {
     return existing.map((row) => row.map((value) => clamp(Math.round(value), 0, 4)));
   }
-
-  // TODO(api): replace with backend hourly/weekday throughput matrix once endpoint includes explicit heatmap bins.
-  const hash = hashHandle(entry.handle);
-  const baseLoad = clamp(Math.round(entry.totals.commitsPerDay / 2), 0, 4);
-  return Array.from({ length: 4 }, (_, week) =>
-    Array.from({ length: 7 }, (_, day) => {
-      const cell = Math.sin(hash * 0.03 + week * 1.5 + day * 0.65) * 2 + baseLoad;
-      return clamp(Math.round(cell), 0, 4);
-    }),
-  );
+  return [];
 }
 
 function deriveCrowns(entry: LeaderboardEntry): string[] {
@@ -173,13 +290,7 @@ function resolveInsightFeed(entry: LeaderboardEntry): string[] {
   if (entry.profile?.rotatingInsights?.length) {
     return entry.profile.rotatingInsights;
   }
-
-  // TODO(api): this placeholder rotation should be replaced by backend-generated profile insights.
-  return [
-    'AI insight pending: ingesting merge reliability and review latency to rank automation opportunities.',
-    'Factory floor signal: orchestration opportunities likely in repetitive default-branch merge patterns.',
-    'AI advisor mode: waiting for repo-level toolchain metadata to generate stack-specific recommendations.',
-  ];
+  return [];
 }
 
 function buildTrendPath(points: number[]): { path: string; fillPath: string } {
@@ -207,6 +318,18 @@ function sortByRank(entries: LeaderboardEntry[]): LeaderboardEntry[] {
   return [...entries].sort((a, b) => a.rank - b.rank);
 }
 
+function findNearestRival(entry: LeaderboardEntry, entries: LeaderboardEntry[]): LeaderboardEntry | null {
+  if (entries.length <= 1) {
+    return null;
+  }
+  const higher = entries.find((candidate) => candidate.rank === entry.rank - 1);
+  if (higher) {
+    return higher;
+  }
+  const lower = entries.find((candidate) => candidate.rank === entry.rank + 1);
+  return lower ?? null;
+}
+
 export function App() {
   const [view, setView] = useState<View>('leaderboard');
   const [route, setRoute] = useState<Route>(() => parseRoute(window.location.pathname));
@@ -214,15 +337,20 @@ export function App() {
   const [leaderboardError, setLeaderboardError] = useState<string | null>(null);
   const [profileData, setProfileData] = useState<ProfileResponse | null>(null);
   const [profileError, setProfileError] = useState<string | null>(null);
+  const [isProfileLoading, setIsProfileLoading] = useState(false);
   const [repoInput, setRepoInput] = useState('https://github.com/honojs/hono');
   const [scanResult, setScanResult] = useState<RepoReportCard | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
+  const [scanCompareHandle, setScanCompareHandle] = useState('');
   const [isScanning, setIsScanning] = useState(false);
   const [insightIndex, setInsightIndex] = useState(0);
+  const [lastProfileVisit, setLastProfileVisit] = useState<ProfileVisitSnapshot | null>(null);
+  const [profileWeeklyStreak, setProfileWeeklyStreak] = useState(1);
   const [authIdentity, setAuthIdentity] = useState<AuthIdentity | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
   const [isSigningOut, setIsSigningOut] = useState(false);
+  const profileVisitSignatureRef = useRef<string>('');
 
   const loadAuthState = useCallback(async () => {
     setIsAuthLoading(true);
@@ -257,18 +385,42 @@ export function App() {
     if (route.kind !== 'profile') {
       setProfileData(null);
       setProfileError(null);
+      setIsProfileLoading(false);
+      setLastProfileVisit(null);
+      setProfileWeeklyStreak(1);
       return;
     }
 
+    let cancelled = false;
+    setIsProfileLoading(true);
+    setProfileError(null);
+    setProfileData(null);
+
     fetchProfile(route.handle)
       .then((profile) => {
+        if (cancelled) {
+          return;
+        }
         setProfileData(profile);
         setProfileError(null);
       })
       .catch((error) => {
+        if (cancelled) {
+          return;
+        }
         setProfileData(null);
         setProfileError((error as Error).message);
+      })
+      .finally(() => {
+        if (cancelled) {
+          return;
+        }
+        setIsProfileLoading(false);
       });
+
+    return () => {
+      cancelled = true;
+    };
   }, [route]);
 
   useEffect(() => {
@@ -294,6 +446,19 @@ export function App() {
   }, [loadAuthState]);
 
   const sortedEntries = useMemo(() => sortByRank(leaderboard?.entries ?? []), [leaderboard]);
+
+  useEffect(() => {
+    if (sortedEntries.length === 0) {
+      setScanCompareHandle('');
+      return;
+    }
+    setScanCompareHandle((current) => {
+      if (current.length > 0 && sortedEntries.some((entry) => entry.handle === current)) {
+        return current;
+      }
+      return sortedEntries[0].handle;
+    });
+  }, [sortedEntries]);
 
   const profileEntry = useMemo(() => {
     if (route.kind !== 'profile') {
@@ -362,6 +527,7 @@ export function App() {
     }
     return buildTrendPoints(profileEntry);
   }, [profileData, profileEntry]);
+  const hasProfileTrend = trendPoints.length >= 2;
   const throughputHeatmap = useMemo(() => (profileEntry ? buildThroughputHeatmap(profileEntry) : []), [profileEntry]);
   const hasProfileHeatmap = useMemo(() => isValidHeatmapMatrix(profileEntry?.profile?.throughputHeatmap), [profileEntry]);
   const hasProfileInsights = useMemo(() => Boolean(profileEntry?.profile?.rotatingInsights?.length), [profileEntry]);
@@ -371,6 +537,9 @@ export function App() {
     }
     return profileEntry ? deriveCrowns(profileEntry) : [];
   }, [profileData, profileEntry]);
+  const crownsAttribution = profileData?.crowns.length
+    ? 'Attribution: crowns are supplied by backend profile metadata.'
+    : 'Attribution: crowns are provisional client-side derivations from leaderboard totals.';
   const insightFeed = useMemo(() => (profileEntry ? resolveInsightFeed(profileEntry) : []), [profileEntry]);
   const trendAttribution = useMemo(() => {
     if (!profileEntry) {
@@ -385,14 +554,18 @@ export function App() {
     if (Array.isArray(profileEntry.profile?.trendPoints) && profileEntry.profile.trendPoints.length >= 2) {
       return 'Attribution: trend uses precomputed points from leaderboard profile payload.';
     }
-    return 'Attribution: trend is estimated from current/previous 30d EEH totals while historical points are unavailable.';
+    return 'Attribution: trend data unavailable. Backend profile history points are required before this chart is shown.';
   }, [profileData, profileEntry]);
   const heatmapAttribution = hasProfileHeatmap
     ? 'Attribution: heatmap bins come from profile throughput data in leaderboard payload.'
-    : 'Attribution: heatmap bins are estimated from aggregate commits/day until hourly bins are available.';
+    : 'Attribution: heatmap unavailable. Backend hourly/weekday bins are not present in this profile payload.';
   const insightAttribution = hasProfileInsights
     ? 'Attribution: insight text is supplied by backend profile metadata.'
-    : 'Attribution: insight text is client-side placeholder copy while backend insights are unavailable.';
+    : 'Attribution: insight unavailable. Backend rotating insights are required for this module.';
+  const profileMetricProvenance = profileEntry?.attribution?.notes
+    ? `Provenance: ${profileEntry.attribution.notes}`
+    : 'Provenance: totals come from leaderboard artifact defaults and can include repo-wide signal when strict authored attribution is unavailable.';
+  const profileRival = useMemo(() => (profileEntry ? findNearestRival(profileEntry, sortedEntries) : null), [profileEntry, sortedEntries]);
 
   useEffect(() => {
     setInsightIndex(0);
@@ -411,6 +584,42 @@ export function App() {
       window.clearInterval(interval);
     };
   }, [route.kind, insightFeed]);
+
+  useEffect(() => {
+    if (route.kind !== 'profile' || !profileEntry) {
+      profileVisitSignatureRef.current = '';
+      return;
+    }
+
+    const signature = `${profileEntry.handle}:${profileEntry.rank}:${profileEntry.totals.equivalentEngineeringHours}:${profileEntry.totals.mergedPrsCiVerified}`;
+    if (profileVisitSignatureRef.current === signature) {
+      return;
+    }
+    profileVisitSignatureRef.current = signature;
+
+    const previousVisit = getStoredProfileVisit(profileEntry.handle);
+    setLastProfileVisit(previousVisit);
+
+    const nowIso = new Date().toISOString();
+    const weeklyStreak = computeWeeklyStreak(previousVisit, nowIso);
+    setProfileWeeklyStreak(weeklyStreak);
+
+    setStoredProfileVisit(profileEntry.handle, {
+      capturedAt: nowIso,
+      rank: profileEntry.rank,
+      percentile: profilePercentile,
+      equivalentEngineeringHours: profileEntry.totals.equivalentEngineeringHours,
+      mergedPrsCiVerified: profileEntry.totals.mergedPrsCiVerified,
+      weeklyStreak,
+    });
+
+    trackUxEvent('profile_viewed', {
+      handle: profileEntry.handle,
+      rank: profileEntry.rank,
+      weeklyStreak,
+      hasPreviousVisit: Boolean(previousVisit),
+    });
+  }, [profileEntry, profilePercentile, route.kind]);
 
   function navigate(nextRoute: Route, options: { replace?: boolean } = {}) {
     const nextPath = routeToPath(nextRoute);
@@ -452,13 +661,26 @@ export function App() {
     event.preventDefault();
     setIsScanning(true);
     setScanError(null);
+    trackUxEvent('scan_submitted', {
+      repoUrl: repoInput,
+      signedIn: Boolean(authIdentity),
+    });
 
     try {
       const result = await scanRepository(repoInput);
       setScanResult(result);
+      trackUxEvent('scan_completed', {
+        repo: `${result.repo.owner}/${result.repo.name}`,
+        equivalentEngineeringHours: result.metrics.equivalentEngineeringHours,
+        mergedPrsCiVerified: result.metrics.mergedPrs,
+      });
     } catch (error) {
       setScanError((error as Error).message);
       setScanResult(null);
+      trackUxEvent('scan_failed', {
+        repoUrl: repoInput,
+        reason: (error as Error).message,
+      });
     } finally {
       setIsScanning(false);
     }
@@ -474,6 +696,96 @@ export function App() {
     route.kind === 'profile' &&
     ((normalizedAuthHandle !== null && route.handle === normalizedAuthHandle) ||
       (normalizedAuthLogin !== null && route.handle === normalizedAuthLogin));
+  const appOrigin = window.location.origin;
+  const currentActorHandle = authIdentity?.handle ?? profileEntry?.handle ?? 'open-challenge';
+  const inviteIntentUrl = buildInviteIntentUrl(appOrigin);
+  const profileShareIntentUrl = profileEntry
+    ? buildTweetIntentUrl(
+        `My Mentat Velocity snapshot: #${globalRank ?? profileEntry.rank}, ${formatNumber(profileEntry.totals.equivalentEngineeringHours, 1)} EEH in 30d.`,
+        buildProfileUrl(appOrigin, profileEntry.handle),
+      )
+    : null;
+  const profileChallengeIntentUrl =
+    profileEntry && profileRival
+      ? buildTweetIntentUrl(
+          `I challenge @${profileRival.handle} on Mentat Velocity. Compare our trusted throughput.`,
+          buildChallengeLink(appOrigin, currentActorHandle, profileRival.handle),
+        )
+      : null;
+  const profileRivalEehDelta =
+    profileEntry && profileRival ? profileEntry.totals.equivalentEngineeringHours - profileRival.totals.equivalentEngineeringHours : null;
+  const scanComparisonEntry = useMemo(
+    () => sortedEntries.find((entry) => entry.handle === scanCompareHandle) ?? null,
+    [scanCompareHandle, sortedEntries],
+  );
+  const scanRankPreview = useMemo(() => {
+    if (!scanResult || sortedEntries.length === 0) {
+      return null;
+    }
+    const score = scanResult.metrics.equivalentEngineeringHours;
+    const insertIndex = sortedEntries.findIndex((entry) => score >= entry.totals.equivalentEngineeringHours);
+    const estimatedRank = insertIndex === -1 ? sortedEntries.length + 1 : insertIndex + 1;
+    const estimatedPercentile = clamp((sortedEntries.length + 2 - estimatedRank) / (sortedEntries.length + 1), 0, 1);
+    return {
+      estimatedRank,
+      estimatedPercentile,
+      sampleSize: sortedEntries.length,
+    };
+  }, [scanResult, sortedEntries]);
+  const scanComparison = useMemo(() => {
+    if (!scanResult || !scanComparisonEntry) {
+      return null;
+    }
+    return {
+      eehDelta: scanResult.metrics.equivalentEngineeringHours - scanComparisonEntry.totals.equivalentEngineeringHours,
+      ciPrDelta: scanResult.metrics.mergedPrs - scanComparisonEntry.totals.mergedPrsCiVerified,
+      accelerationDelta: scanResult.metrics.velocityAcceleration - scanComparisonEntry.totals.velocityAcceleration,
+    };
+  }, [scanComparisonEntry, scanResult]);
+  const scanChallengeIntentUrl =
+    scanResult && scanComparisonEntry
+      ? buildTweetIntentUrl(
+          `Scan challenge: can your throughput beat @${scanComparisonEntry.handle}?`,
+          buildChallengeLink(appOrigin, currentActorHandle, scanComparisonEntry.handle),
+        )
+      : null;
+  const profileVisitDelta = useMemo(() => {
+    if (!profileEntry || !lastProfileVisit) {
+      return null;
+    }
+    return {
+      previousRank: lastProfileVisit.rank,
+      daysSince: daysBetweenTimestamps(lastProfileVisit.capturedAt, new Date().toISOString()),
+      rankDelta: lastProfileVisit.rank - profileEntry.rank,
+      eehDelta: profileEntry.totals.equivalentEngineeringHours - lastProfileVisit.equivalentEngineeringHours,
+      ciPrDelta: profileEntry.totals.mergedPrsCiVerified - lastProfileVisit.mergedPrsCiVerified,
+      previousCapturedAt: lastProfileVisit.capturedAt,
+    };
+  }, [lastProfileVisit, profileEntry]);
+  const nextWeeklyCheckInDays = useMemo(() => {
+    if (!lastProfileVisit) {
+      return 7;
+    }
+    const daysSince = daysBetweenTimestamps(lastProfileVisit.capturedAt, new Date().toISOString());
+    if (daysSince === null) {
+      return 7;
+    }
+    return clamp(7 - daysSince, 0, 7);
+  }, [lastProfileVisit]);
+  const normalizedActorHandle = currentActorHandle.toLowerCase();
+  const defaultChallengeTarget = sortedEntries.find((entry) => entry.handle !== normalizedActorHandle) ?? null;
+  const myProfileShareIntentUrl = authIdentity
+    ? buildTweetIntentUrl(
+        `My Mentat Velocity profile is live. Benchmark my AI-verified throughput.`,
+        buildProfileUrl(appOrigin, authIdentity.handle),
+      )
+    : null;
+  const leaderboardChallengeIntentUrl = defaultChallengeTarget
+    ? buildTweetIntentUrl(
+        `Open challenge: @${defaultChallengeTarget.handle}, let's compare AI-verified throughput on Mentat Velocity.`,
+        buildChallengeLink(appOrigin, currentActorHandle, defaultChallengeTarget.handle),
+      )
+    : null;
 
   return (
     <div className="min-h-screen bg-app text-ink-1 font-sans">
@@ -549,7 +861,17 @@ export function App() {
 
       <main className="mx-auto max-w-7xl px-4 py-6 md:px-6 lg:px-8">
         {route.kind === 'profile' ? (
-          profileEntry ? (
+          isProfileLoading && !profileEntry ? (
+            <section className="rounded-xl border border-slate-700/80 bg-surface-1 p-5 shadow-soft">
+              <h2 className="font-display text-2xl">Loading Profile</h2>
+              <p className="mt-2 text-sm text-ink-2">Fetching trusted profile data for @{route.handle}.</p>
+              <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <div className="h-20 animate-pulse rounded-lg border border-slate-700 bg-surface-2" />
+                <div className="h-20 animate-pulse rounded-lg border border-slate-700 bg-surface-2" />
+                <div className="h-20 animate-pulse rounded-lg border border-slate-700 bg-surface-2" />
+              </div>
+            </section>
+          ) : profileEntry ? (
             <section className="space-y-6">
               <div className="rounded-xl border border-slate-700/80 bg-surface-1 p-5 shadow-soft">
                 <div className="flex flex-wrap items-start justify-between gap-3">
@@ -573,6 +895,57 @@ export function App() {
                       ) : null}
                     </div>
                   </div>
+                </div>
+                <div className="mt-4 flex flex-wrap items-center gap-2">
+                  {profileShareIntentUrl ? (
+                    <a
+                      className="rounded-lg border border-cyan-400/60 bg-cyan-500/10 px-3 py-2 text-xs font-mono text-cyan-100 hover:bg-cyan-500/20"
+                      href={profileShareIntentUrl}
+                      onClick={() =>
+                        trackUxEvent('profile_share_clicked', {
+                          handle: profileEntry.handle,
+                          source: 'profile_header',
+                        })
+                      }
+                      rel="noreferrer"
+                      target="_blank"
+                    >
+                      Share Profile
+                    </a>
+                  ) : null}
+                  {profileChallengeIntentUrl && profileRival ? (
+                    <a
+                      className="rounded-lg border border-amber-400/50 bg-amber-400/10 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/20"
+                      href={profileChallengeIntentUrl}
+                      onClick={() =>
+                        trackUxEvent('challenge_link_clicked', {
+                          challenger: currentActorHandle,
+                          target: profileRival.handle,
+                          source: 'profile_header',
+                        })
+                      }
+                      rel="noreferrer"
+                      target="_blank"
+                    >
+                      Challenge @{profileRival.handle}
+                    </a>
+                  ) : (
+                    <span className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-mono text-ink-3">Challenge link unavailable: no comparable rival yet.</span>
+                  )}
+                  <a
+                    className="rounded-lg border border-slate-600 px-3 py-2 text-xs font-mono text-ink-2 hover:border-cyan-400 hover:text-ink-1"
+                    href={inviteIntentUrl}
+                    onClick={() =>
+                      trackUxEvent('invite_link_clicked', {
+                        source: 'profile_header',
+                        handle: profileEntry.handle,
+                      })
+                    }
+                    rel="noreferrer"
+                    target="_blank"
+                  >
+                    Invite Peer
+                  </a>
                 </div>
                 <p className="mt-4 max-w-4xl rounded-lg border border-slate-700 bg-surface-2 px-3 py-2 text-xs leading-relaxed text-ink-2">{profileAttributionSummary}</p>
 
@@ -604,6 +977,51 @@ export function App() {
                     </p>
                   </div>
                 </div>
+                <p className="mt-3 rounded-md border border-slate-700 bg-surface-2/80 px-3 py-2 text-xs leading-relaxed text-ink-2">{profileMetricProvenance}</p>
+                <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-3">
+                  <div className="rounded-lg border border-emerald-400/35 bg-emerald-500/10 p-3">
+                    <p className="font-mono text-xs uppercase tracking-[0.08em] text-emerald-100">Weekly Streak</p>
+                    <p className="mt-1 font-mono text-xl text-emerald-100">{profileWeeklyStreak} week(s)</p>
+                    <p className="mt-1 text-xs text-emerald-200/90">Next weekly checkpoint in {nextWeeklyCheckInDays} day(s).</p>
+                  </div>
+                  <div className="rounded-lg border border-slate-700 bg-surface-2 p-3 lg:col-span-2">
+                    <p className="font-mono text-xs uppercase tracking-[0.08em] text-ink-3">What Changed Since Last Visit</p>
+                    {profileVisitDelta ? (
+                      <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-3">
+                        <div className="rounded border border-slate-700 p-2">
+                          <p className="font-mono text-[11px] uppercase tracking-[0.08em] text-ink-3">Rank Delta</p>
+                          <p className={`font-mono text-sm ${profileVisitDelta.rankDelta >= 0 ? 'text-state-success' : 'text-state-warning'}`}>
+                            {formatRankDelta(profileVisitDelta.previousRank, profileEntry.rank)}
+                          </p>
+                        </div>
+                        <div className="rounded border border-slate-700 p-2">
+                          <p className="font-mono text-[11px] uppercase tracking-[0.08em] text-ink-3">EEH Delta</p>
+                          <p className={`font-mono text-sm ${profileVisitDelta.eehDelta >= 0 ? 'text-state-success' : 'text-state-warning'}`}>
+                            {formatSignedDelta(profileVisitDelta.eehDelta, 1)}
+                          </p>
+                        </div>
+                        <div className="rounded border border-slate-700 p-2">
+                          <p className="font-mono text-[11px] uppercase tracking-[0.08em] text-ink-3">CI PR Delta</p>
+                          <p className={`font-mono text-sm ${profileVisitDelta.ciPrDelta >= 0 ? 'text-state-success' : 'text-state-warning'}`}>
+                            {formatSignedDelta(profileVisitDelta.ciPrDelta, 0)}
+                          </p>
+                        </div>
+                      </div>
+                    ) : (
+                      <p className="mt-2 text-sm text-ink-2">First profile visit recorded. Return next week to unlock trend deltas.</p>
+                    )}
+                    {profileRival && profileRivalEehDelta !== null ? (
+                      <p className="mt-2 text-xs text-ink-2">
+                        Weekly compare snapshot: vs @{profileRival.handle}, EEH delta is {formatSignedDelta(profileRivalEehDelta, 1)}.
+                      </p>
+                    ) : null}
+                    {profileVisitDelta && profileVisitDelta.daysSince !== null ? (
+                      <p className="mt-2 font-mono text-xs text-ink-3">
+                        Last visit snapshot: {new Date(profileVisitDelta.previousCapturedAt).toLocaleString()} ({profileVisitDelta.daysSince} day(s) ago)
+                      </p>
+                    ) : null}
+                  </div>
+                </div>
               </div>
 
               <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
@@ -613,7 +1031,7 @@ export function App() {
                     <p className="font-mono text-xs uppercase tracking-[0.08em] text-ink-3">30d velocity arc</p>
                   </div>
                   <p className="mb-3 rounded-md border border-slate-700 bg-surface-2/80 px-3 py-2 text-xs leading-relaxed text-ink-2">{trendAttribution}</p>
-                  {profileTrendPath ? (
+                  {hasProfileTrend && profileTrendPath ? (
                     <svg
                       className="w-full overflow-visible rounded-lg border border-slate-700 bg-slate-950/35 p-2"
                       viewBox={`0 0 ${TREND_CHART_WIDTH} ${TREND_CHART_HEIGHT}`}
@@ -639,25 +1057,29 @@ export function App() {
                   <h3 className="font-display text-xl">Throughput Heatmap</h3>
                   <p className="mt-1 font-mono text-xs uppercase tracking-[0.08em] text-ink-3">Compact weekly throughput bins</p>
                   <p className="mt-3 rounded-md border border-slate-700 bg-surface-2/80 px-3 py-2 text-xs leading-relaxed text-ink-2">{heatmapAttribution}</p>
-                  <div className="mt-4 space-y-1">
-                    {throughputHeatmap.map((row, rowIndex) => (
-                      <div key={`row-${rowIndex}`} className="flex gap-1">
-                        {row.map((value, colIndex) => {
-                          const color =
-                            value === 0
-                              ? 'bg-slate-800'
-                              : value === 1
-                                ? 'bg-cyan-900/60'
-                                : value === 2
-                                  ? 'bg-cyan-700/70'
-                                  : value === 3
-                                    ? 'bg-cyan-500/80'
-                                    : 'bg-cyan-300';
-                          return <div key={`cell-${rowIndex}-${colIndex}`} className={`h-4 w-4 rounded-[3px] border border-slate-700 ${color}`} title={`Load level ${value}`} />;
-                        })}
-                      </div>
-                    ))}
-                  </div>
+                  {throughputHeatmap.length > 0 ? (
+                    <div className="mt-4 space-y-1">
+                      {throughputHeatmap.map((row, rowIndex) => (
+                        <div key={`row-${rowIndex}`} className="flex gap-1">
+                          {row.map((value, colIndex) => {
+                            const color =
+                              value === 0
+                                ? 'bg-slate-800'
+                                : value === 1
+                                  ? 'bg-cyan-900/60'
+                                  : value === 2
+                                    ? 'bg-cyan-700/70'
+                                    : value === 3
+                                      ? 'bg-cyan-500/80'
+                                      : 'bg-cyan-300';
+                            return <div key={`cell-${rowIndex}-${colIndex}`} className={`h-4 w-4 rounded-[3px] border border-slate-700 ${color}`} title={`Load level ${value}`} />;
+                          })}
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="mt-4 rounded-lg border border-dashed border-slate-700 p-4 text-sm text-ink-2">Heatmap data unavailable for this profile.</p>
+                  )}
                   <div className="mt-4 flex flex-wrap items-start gap-2">
                     {crowns.map((crown) => (
                       <span
@@ -668,6 +1090,7 @@ export function App() {
                       </span>
                     ))}
                   </div>
+                  <p className="mt-3 rounded-md border border-slate-700 bg-surface-2/80 px-3 py-2 text-xs leading-relaxed text-ink-2">{crownsAttribution}</p>
                 </section>
               </div>
 
@@ -721,11 +1144,12 @@ export function App() {
                   <h3 className="font-display text-lg">Latest Insight</h3>
                   <p className="mt-3 rounded-md border border-slate-700 bg-surface-2/80 px-3 py-2 text-xs leading-relaxed text-ink-2">{insightAttribution}</p>
                   <div className="mt-3 rounded-lg border border-slate-700 bg-surface-2 p-3">
-                    <p className="text-sm text-ink-2">{insightFeed[insightIndex] ?? 'Insight pipeline loading.'}</p>
+                    {insightFeed.length > 0 ? (
+                      <p className="text-sm text-ink-2">{insightFeed[insightIndex] ?? insightFeed[0]}</p>
+                    ) : (
+                      <p className="text-sm text-ink-2">No backend insight is available for this profile yet.</p>
+                    )}
                   </div>
-                  <p className="mt-4 text-xs text-ink-3">
-                    Placeholder mode is active when backend profile insights are unavailable.
-                  </p>
                 </aside>
               </section>
             </section>
@@ -778,6 +1202,59 @@ export function App() {
                   </div>
                 </div>
 
+                <div className="mt-4 flex flex-wrap items-center gap-2">
+                  {myProfileShareIntentUrl ? (
+                    <a
+                      className="rounded-lg border border-cyan-400/60 bg-cyan-500/10 px-3 py-2 text-xs font-mono text-cyan-100 hover:bg-cyan-500/20"
+                      href={myProfileShareIntentUrl}
+                      onClick={() =>
+                        trackUxEvent('profile_share_clicked', {
+                          source: 'home_hero',
+                          handle: authIdentity?.handle ?? 'signed-out',
+                        })
+                      }
+                      rel="noreferrer"
+                      target="_blank"
+                    >
+                      Share My Profile
+                    </a>
+                  ) : (
+                    <a
+                      className="rounded-lg border border-slate-600 px-3 py-2 text-xs font-mono text-ink-2 hover:border-cyan-400 hover:text-ink-1"
+                      href="/api/auth/github/start"
+                      onClick={() => trackUxEvent('claim_profile_clicked', { source: 'home_hero', signedIn: false })}
+                    >
+                      Sign in to Claim Profile
+                    </a>
+                  )}
+                  {leaderboardChallengeIntentUrl && defaultChallengeTarget ? (
+                    <a
+                      className="rounded-lg border border-amber-400/50 bg-amber-400/10 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/20"
+                      href={leaderboardChallengeIntentUrl}
+                      onClick={() =>
+                        trackUxEvent('challenge_link_clicked', {
+                          source: 'home_hero',
+                          challenger: currentActorHandle,
+                          target: defaultChallengeTarget.handle,
+                        })
+                      }
+                      rel="noreferrer"
+                      target="_blank"
+                    >
+                      Challenge @{defaultChallengeTarget.handle}
+                    </a>
+                  ) : null}
+                  <a
+                    className="rounded-lg border border-slate-600 px-3 py-2 text-xs font-mono text-ink-2 hover:border-cyan-400 hover:text-ink-1"
+                    href={inviteIntentUrl}
+                    onClick={() => trackUxEvent('invite_link_clicked', { source: 'home_hero' })}
+                    rel="noreferrer"
+                    target="_blank"
+                  >
+                    Invite Peer
+                  </a>
+                </div>
+
                 <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
                   <div className="rounded-lg border border-slate-700 bg-surface-2 p-3">
                     <p className="font-mono text-xs uppercase tracking-wide text-ink-3">Seed Handles</p>
@@ -809,26 +1286,89 @@ export function App() {
                   </p>
                   {leaderboardError ? <p className="text-sm text-state-danger">{leaderboardError}</p> : null}
                   <div className="mb-3 grid gap-3 sm:hidden">
-                    {sortedEntries.map((entry) => (
-                      <div key={`${entry.handle}-mobile`} className="rounded-lg border border-slate-700 bg-slate-950/35 p-3">
-                        <div className="flex items-center justify-between gap-2">
-                          <button className="font-mono text-xs text-accent-2 hover:underline" onClick={() => openProfile(entry.handle)} type="button">
-                            #{entry.rank} @{entry.handle}
-                          </button>
-                          <p className="font-mono text-xs text-ink-3">{entry.scannedRepos} repo(s)</p>
+                    {sortedEntries.map((entry) => {
+                      const percentile = getPercentile(entry, sortedEntries.length);
+                      const nextHigher = sortedEntries.find((candidate) => candidate.rank === entry.rank - 1) ?? null;
+                      const eehGapToNext = nextHigher ? nextHigher.totals.equivalentEngineeringHours - entry.totals.equivalentEngineeringHours : null;
+                      const shareEntryIntentUrl = buildTweetIntentUrl(
+                        `Mentat Velocity profile check: @${entry.handle} is currently #${entry.rank}.`,
+                        buildProfileUrl(appOrigin, entry.handle),
+                      );
+                      const challengeEntryIntentUrl = buildTweetIntentUrl(
+                        `I challenge @${entry.handle} on Mentat Velocity.`,
+                        buildChallengeLink(appOrigin, currentActorHandle, entry.handle),
+                      );
+                      return (
+                        <div key={`${entry.handle}-mobile`} className="rounded-lg border border-slate-700 bg-slate-950/35 p-3">
+                          <div className="flex items-center justify-between gap-2">
+                            <button className="font-mono text-xs text-accent-2 hover:underline" onClick={() => openProfile(entry.handle)} type="button">
+                              #{entry.rank} @{entry.handle}
+                            </button>
+                            <p className="font-mono text-xs text-ink-3">{entry.scannedRepos} repo(s)</p>
+                          </div>
+                          <div className="mt-2 flex items-center justify-between">
+                            <p className="text-sm text-ink-2">Percentile</p>
+                            <p className="font-mono text-sm">{formatPercent(percentile)}</p>
+                          </div>
+                          <div className="mt-1 flex items-center justify-between">
+                            <p className="text-sm text-ink-2">EEH</p>
+                            <p className="font-mono text-sm">{formatNumber(entry.totals.equivalentEngineeringHours, 1)}</p>
+                          </div>
+                          <div className="mt-1 flex items-center justify-between">
+                            <p className="text-sm text-ink-2">CI Merged PRs</p>
+                            <p className="font-mono text-sm">{formatNumber(entry.totals.mergedPrsCiVerified, 0)}</p>
+                          </div>
+                          <div className="mt-1 flex items-center justify-between">
+                            <p className="text-sm text-ink-2">EEH Accel</p>
+                            <p className={`font-mono text-sm ${entry.totals.velocityAcceleration >= 0 ? 'text-state-success' : 'text-state-warning'}`}>
+                              {formatAcceleration(entry.totals.velocityAcceleration)}
+                            </p>
+                          </div>
+                          {eehGapToNext !== null ? (
+                            <div className="mt-1 flex items-center justify-between">
+                              <p className="text-sm text-ink-2">Gap to #{nextHigher?.rank}</p>
+                              <p className="font-mono text-sm text-ink-2">{formatNumber(Math.max(0, eehGapToNext), 1)} EEH</p>
+                            </div>
+                          ) : (
+                            <div className="mt-1 flex items-center justify-between">
+                              <p className="text-sm text-ink-2">Lead Position</p>
+                              <p className="font-mono text-sm text-state-success">#1 pace</p>
+                            </div>
+                          )}
+                          <div className="mt-3 flex items-center gap-2">
+                            <a
+                              className="rounded border border-cyan-400/50 bg-cyan-500/10 px-2.5 py-1 text-[11px] font-mono text-cyan-100 hover:bg-cyan-500/20"
+                              href={shareEntryIntentUrl}
+                              onClick={() =>
+                                trackUxEvent('profile_share_clicked', {
+                                  source: 'leaderboard_mobile_row',
+                                  handle: entry.handle,
+                                })
+                              }
+                              rel="noreferrer"
+                              target="_blank"
+                            >
+                              Share
+                            </a>
+                            <a
+                              className="rounded border border-amber-400/50 bg-amber-400/10 px-2.5 py-1 text-[11px] font-mono text-amber-100 hover:bg-amber-400/20"
+                              href={challengeEntryIntentUrl}
+                              onClick={() =>
+                                trackUxEvent('challenge_link_clicked', {
+                                  source: 'leaderboard_mobile_row',
+                                  challenger: currentActorHandle,
+                                  target: entry.handle,
+                                })
+                              }
+                              rel="noreferrer"
+                              target="_blank"
+                            >
+                              Challenge
+                            </a>
+                          </div>
                         </div>
-                        <div className="mt-2 flex items-center justify-between">
-                          <p className="text-sm text-ink-2">EEH</p>
-                          <p className="font-mono text-sm">{formatNumber(entry.totals.equivalentEngineeringHours, 1)}</p>
-                        </div>
-                        <div className="mt-1 flex items-center justify-between">
-                          <p className="text-sm text-ink-2">EEH Accel</p>
-                          <p className={`font-mono text-sm ${entry.totals.velocityAcceleration >= 0 ? 'text-state-success' : 'text-state-warning'}`}>
-                            {formatAcceleration(entry.totals.velocityAcceleration)}
-                          </p>
-                        </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                   <div className="overflow-x-auto rounded-lg border border-slate-800/80 bg-slate-950/35">
                     <table className="hidden w-full min-w-[720px] text-left text-sm sm:table">
@@ -887,6 +1427,43 @@ export function App() {
                                 <p className="font-mono text-xs text-ink-3">AI-Ready: {entry.aiReadyScore}%</p>
                               )}
                               {entry.scanInsight ? <p className="font-mono text-xs text-ink-3">{entry.scanInsight}</p> : null}
+                              <div className="mt-2 flex flex-wrap gap-2">
+                                <a
+                                  className="rounded border border-cyan-400/50 bg-cyan-500/10 px-2 py-1 font-mono text-[11px] text-cyan-100 hover:bg-cyan-500/20"
+                                  href={buildTweetIntentUrl(
+                                    `Mentat Velocity profile check: @${entry.handle} is currently #${entry.rank}.`,
+                                    buildProfileUrl(appOrigin, entry.handle),
+                                  )}
+                                  onClick={() =>
+                                    trackUxEvent('profile_share_clicked', {
+                                      source: 'leaderboard_table_row',
+                                      handle: entry.handle,
+                                    })
+                                  }
+                                  rel="noreferrer"
+                                  target="_blank"
+                                >
+                                  Share
+                                </a>
+                                <a
+                                  className="rounded border border-amber-400/50 bg-amber-400/10 px-2 py-1 font-mono text-[11px] text-amber-100 hover:bg-amber-400/20"
+                                  href={buildTweetIntentUrl(
+                                    `I challenge @${entry.handle} on Mentat Velocity.`,
+                                    buildChallengeLink(appOrigin, currentActorHandle, entry.handle),
+                                  )}
+                                  onClick={() =>
+                                    trackUxEvent('challenge_link_clicked', {
+                                      source: 'leaderboard_table_row',
+                                      challenger: currentActorHandle,
+                                      target: entry.handle,
+                                    })
+                                  }
+                                  rel="noreferrer"
+                                  target="_blank"
+                                >
+                                  Challenge
+                                </a>
+                              </div>
                             </td>
                             <td className="px-2 py-3">
                               {entry.featuredRepo ? (
@@ -984,6 +1561,120 @@ export function App() {
                           <p className="mt-1 font-mono text-lg">{formatNumber(scanResult.metrics.equivalentEngineeringHours, 1)}</p>
                         </div>
                       </div>
+                      <p className="mt-3 rounded-md border border-slate-700 bg-surface-2/80 px-3 py-2 text-xs leading-relaxed text-ink-2">
+                        Provenance: {scanResult.attribution.notes} Mode: {scanResult.attribution.mode}. Policy:{' '}
+                        {scanResult.attribution.policy ?? 'repo-wide-non-bot-default-branch'}.
+                      </p>
+
+                      <div className="mt-4 rounded-lg border border-cyan-500/40 bg-cyan-500/10 p-3">
+                        <p className="font-mono text-xs uppercase tracking-[0.08em] text-cyan-100">Post-Scan Leaderboard Lane</p>
+                        <div className="mt-3 flex flex-wrap items-center gap-2">
+                          {authIdentity ? (
+                            <button
+                              className="rounded-md border border-cyan-300/60 bg-cyan-500/20 px-3 py-2 text-xs font-mono text-cyan-100 hover:bg-cyan-500/30"
+                              onClick={() => {
+                                trackUxEvent('claim_profile_clicked', { source: 'scan_lane', signedIn: true, handle: authIdentity.handle });
+                                openProfile(authIdentity.handle);
+                              }}
+                              type="button"
+                            >
+                              Claim/View My Profile
+                            </button>
+                          ) : (
+                            <a
+                              className="rounded-md border border-cyan-300/60 bg-cyan-500/20 px-3 py-2 text-xs font-mono text-cyan-100 hover:bg-cyan-500/30"
+                              href="/api/auth/github/start"
+                              onClick={() => trackUxEvent('claim_profile_clicked', { source: 'scan_lane', signedIn: false })}
+                            >
+                              Sign in to Claim Profile
+                            </a>
+                          )}
+                          <button
+                            className="rounded-md border border-slate-600 px-3 py-2 text-xs font-mono text-ink-1 hover:border-cyan-400"
+                            onClick={() => {
+                              setView('leaderboard');
+                              trackUxEvent('scan_to_leaderboard_clicked', { source: 'scan_lane' });
+                            }}
+                            type="button"
+                          >
+                            View Ranking Impact
+                          </button>
+                          {scanChallengeIntentUrl && scanComparisonEntry ? (
+                            <a
+                              className="rounded-md border border-amber-400/50 bg-amber-400/10 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/20"
+                              href={scanChallengeIntentUrl}
+                              onClick={() =>
+                                trackUxEvent('challenge_link_clicked', {
+                                  source: 'scan_lane',
+                                  challenger: currentActorHandle,
+                                  target: scanComparisonEntry.handle,
+                                })
+                              }
+                              rel="noreferrer"
+                              target="_blank"
+                            >
+                              Challenge @{scanComparisonEntry.handle}
+                            </a>
+                          ) : null}
+                        </div>
+
+                        <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
+                          <div className="rounded-md border border-slate-700 bg-surface-2 p-3">
+                            <p className="font-mono text-xs uppercase tracking-[0.08em] text-ink-3">Ranking Impact Preview</p>
+                            {scanRankPreview ? (
+                              <>
+                                <p className="mt-1 font-mono text-lg text-ink-1">Estimated rank #{scanRankPreview.estimatedRank}</p>
+                                <p className="font-mono text-xs text-ink-2">Estimated percentile {formatPercent(scanRankPreview.estimatedPercentile)}</p>
+                                <p className="mt-2 text-xs text-ink-3">
+                                  Preview compares this scan’s EEH against {scanRankPreview.sampleSize} current leaderboard profiles and is non-authoritative until backend refresh.
+                                </p>
+                              </>
+                            ) : (
+                              <p className="mt-1 text-sm text-ink-2">Ranking preview unavailable until leaderboard data is loaded.</p>
+                            )}
+                          </div>
+                          <div className="rounded-md border border-slate-700 bg-surface-2 p-3">
+                            <label className="font-mono text-xs uppercase tracking-[0.08em] text-ink-3" htmlFor="scan-compare-handle">
+                              Compare Against Developer
+                            </label>
+                            <select
+                              id="scan-compare-handle"
+                              className="mt-2 w-full rounded-md border border-slate-600 bg-slate-950/60 px-2 py-2 text-sm text-ink-1 outline-none focus:border-cyan-400"
+                              onChange={(event) => {
+                                setScanCompareHandle(event.target.value);
+                                trackUxEvent('scan_compare_target_selected', {
+                                  source: 'scan_lane',
+                                  target: event.target.value,
+                                });
+                              }}
+                              value={scanCompareHandle}
+                            >
+                              {sortedEntries.length === 0 ? <option value="">No leaderboard entries</option> : null}
+                              {sortedEntries.map((entry) => (
+                                <option key={`scan-compare-${entry.handle}`} value={entry.handle}>
+                                  @{entry.handle} (#{entry.rank})
+                                </option>
+                              ))}
+                            </select>
+                            {scanComparison && scanComparisonEntry ? (
+                              <div className="mt-2 space-y-1 text-xs text-ink-2">
+                                <p>
+                                  EEH delta vs @{scanComparisonEntry.handle}: {formatSignedDelta(scanComparison.eehDelta, 1)}
+                                </p>
+                                <p>
+                                  CI PR delta vs @{scanComparisonEntry.handle}: {formatSignedDelta(scanComparison.ciPrDelta, 0)}
+                                </p>
+                                <p>
+                                  Acceleration delta vs @{scanComparisonEntry.handle}: {formatAcceleration(scanComparison.accelerationDelta)}
+                                </p>
+                              </div>
+                            ) : (
+                              <p className="mt-2 text-xs text-ink-3">Select a target to preview a head-to-head comparison.</p>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
                       <div className="mt-4 overflow-hidden rounded-md border border-slate-700">
                         <div className="border-b border-slate-700 bg-slate-900 px-3 py-2 font-mono text-xs uppercase tracking-wide text-ink-3">
                           Raw Report Card JSON

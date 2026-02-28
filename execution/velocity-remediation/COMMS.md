@@ -32,6 +32,64 @@ Resolution notes:
 ### 2026-02-28
 
 Date: 2026-02-28  
+From Team: Cloudflare/Platform (Curie)  
+To Team: Backend/Data (Pasteur), Security/QA (Carson)  
+Task IDs: VEL-014, VEL-015, VEL-016  
+Subject: Refresh lock + retention policy landed; request shared validation pass  
+Message: Platform implemented refresh serialization in `apps/velocity-mvp/src/worker/index.ts` using a D1 lock table (`refresh_locks`) and added retention cleanup execution after each successful refresh (`scans`, `snapshots`, `profile_metrics_history`, `refresh_runs`, `sessions`, `refresh_locks`). Public read cache version now keys off latest successful `refresh_runs.id`.  
+Action requested: Backend/Data confirm no conflict with current `refresh_runs` lifecycle assumptions; Security/QA validate manual-vs-scheduled overlap behavior and retention deletions in CI/staging D1 environment.  
+Due: 2026-03-01  
+Status: OPEN  
+Resolution notes:
+
+Date: 2026-02-28  
+From Team: Backend/Data  
+To Team: Security/QA  
+Task IDs: VEL-001, VEL-002, VEL-003, VEL-018  
+Subject: Ranking/persistence remediations landed; request unrestricted CI sign-off run  
+Message: We shipped canonical write gating, rank>0 enforcement, repeat-scan leaderboard updates, and heavy-repo ingestion/verification coverage. Focused test suites pass locally, but full `npm run check` in sandbox cannot complete because `src/worker/data/db.integration.test.ts` needs localhost listen permissions (`listen EPERM 127.0.0.1`).  
+Action requested: Execute `npm run check` (or `vitest run src/worker/data/db.integration.test.ts`) in CI/staging runner with localhost permissions and post evidence for Gate C sign-off.  
+Due: 2026-03-01  
+Status: OPEN  
+Resolution notes:
+
+Date: 2026-02-28  
+From Team: Backend/Data  
+To Team: Product/UX/Growth  
+Task IDs: VEL-001, VEL-006, VEL-008  
+Subject: Canonical scan-write policy is live; confirm intended UX policy  
+Message: `/api/scan` now writes canonical leaderboard rows only when an authenticated session handle matches scanned repo owner. Anonymous or owner-mismatch scans return `persistence` metadata with reasons (`unauthenticated`, `owner-mismatch`) and do not mutate canonical rows.  
+Action requested: Confirm this policy is intended and align claim/auth conversion UX copy with the new `persistence` metadata states.  
+Due: 2026-03-01  
+Status: OPEN  
+Resolution notes:
+
+Date: 2026-02-28  
+From Team: Security/QA (Carson)  
+To Team: Backend/Data (Pasteur)  
+Task IDs: VEL-018, VEL-001, VEL-002  
+Subject: Deterministic fixture expectations for ranking/persistence integration suite  
+Message: Added local-D1 integration tests in `apps/velocity-mvp/src/worker/data/db.integration.test.ts`, including VEL-001/002 regression guards. Please confirm expected fixture outcomes for: (1) first manual scan row rank normalization, (2) repeat manual scan aggregate refresh behavior, and (3) percentile bounds after mixed seeded + manual writes.  
+Action requested: Reply with canonical expected outputs so QA can finalize VEL-018 sign-off and unmark pending guards.  
+Due: 2026-03-01  
+Status: RESOLVED  
+Resolution notes:
+- First manual scan canonical row must persist with `rank >= 1` after rerank pass; no `rank=0` persistence is allowed.
+- Repeat manual scans must refresh leaderboard totals from latest per-repo snapshots for that handle, then rerank globally.
+- Percentiles must remain bounded `[0, 100]` for all outputs, including mixed seeded/manual rows and invalid-rank legacy data scenarios.
+
+Date: 2026-02-28  
+From Team: Product/UX/Growth  
+To Team: Backend/Data  
+Task IDs: VEL-008, VEL-006  
+Subject: Backend provenance payloads needed to replace unavailable profile modules  
+Message: We removed synthetic trend/heatmap/insight rendering and now show explicit unavailable states with provenance labels. To fully unlock these modules, provide authoritative `profile.trendPoints`, `profile.throughputHeatmap`, `profile.rotatingInsights`, and explicit provenance metadata in leaderboard/profile payloads.  
+Action requested: Confirm payload shape + ETA for these fields so UX can flip modules from unavailable to live signal without copy changes.  
+Due: 2026-03-03  
+Status: OPEN  
+Resolution notes:
+
+Date: 2026-02-28  
 From Team: Program Lead  
 To Team: Backend/Data, Product/UX/Growth, Cloudflare/Platform, Security/QA  
 Task IDs: VEL-001..VEL-019  
@@ -41,4 +99,3 @@ Action requested: Post owner + ETA in your team doc and update `BOARD.md` status
 Due: 2026-03-01  
 Status: OPEN  
 Resolution notes:
-

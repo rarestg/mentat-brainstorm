@@ -161,6 +161,22 @@ describe('worker routes', () => {
     expect(getLeaderboardArtifactMock).toHaveBeenCalled();
   });
 
+  it('marks leaderboard response as fallback when D1 read fails', async () => {
+    getLeaderboardArtifactMock.mockRejectedValueOnce(new Error('D1 exploded'));
+
+    const response = await app.request('http://localhost/api/leaderboard', undefined, { DB: {} as D1Database });
+    expect(response.status).toBe(200);
+
+    const body = (await response.json()) as {
+      dataSource?: { kind?: string; fallback?: boolean; healthy?: boolean; reason?: string; message?: string };
+    };
+    expect(body.dataSource?.kind).toBe('static-artifact');
+    expect(body.dataSource?.fallback).toBe(true);
+    expect(body.dataSource?.healthy).toBe(false);
+    expect(body.dataSource?.reason).toBe('d1-read-failure');
+    expect(body.dataSource?.message).toContain('D1 exploded');
+  });
+
   it('returns 400 for invalid scan payload', async () => {
     const response = await app.request('http://localhost/api/scan', {
       method: 'POST',
@@ -245,6 +261,71 @@ describe('worker routes', () => {
       },
       windows: [],
     });
+    getSessionIdentityByTokenHashMock.mockResolvedValueOnce({
+      sessionId: 'sess-1',
+      handle: 'acme',
+      userId: 1,
+      expiresAt: '2026-03-15T00:00:00.000Z',
+      provider: 'github',
+      providerLogin: 'acme',
+      providerUserId: '101',
+      avatarUrl: null,
+      profileUrl: null,
+    });
+
+    const response = await app.request(
+      'http://localhost/api/scan',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          cookie: 'velocity_session=abc123',
+        },
+        body: JSON.stringify({ repoUrl: 'https://github.com/acme/repo' }),
+      },
+      {
+        DB: {} as D1Database,
+        GITHUB_TOKEN: undefined,
+        SESSION_SECRET: 'session-secret',
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(persistScanReportMock).toHaveBeenCalledTimes(1);
+    const body = (await response.json()) as { persistence?: { canonicalLeaderboardWrite?: boolean; reason?: string } };
+    expect(body.persistence?.canonicalLeaderboardWrite).toBe(true);
+    expect(body.persistence?.reason).toBe('persisted');
+  });
+
+  it('does not persist scan result for anonymous requests', async () => {
+    scanRepoByUrlMock.mockResolvedValue({
+      repo: { owner: 'acme', name: 'repo', url: 'https://github.com/acme/repo' },
+      scannedAt: '2026-02-27T00:00:00.000Z',
+      attribution: {
+        mode: 'repo-wide',
+        source: 'github-author-login-match',
+        strict: false,
+        productionReady: true,
+        notes: 'repo-wide fallback',
+      },
+      assumptions: {
+        offHoursDefinitionUtc: 'off-hours',
+        equivalentEngineeringHoursFormula: 'eeh formula',
+        defaultBranchScope: 'Merged PRs were evaluated only when targeting the repository default branch.',
+        ciVerification: 'CI-verified merged PRs require merge commit SHA plus passing checks.',
+      },
+      metrics: {
+        commitsPerDay: 1,
+        mergedPrsUnverified: 3,
+        mergedPrsCiVerified: 2,
+        mergedPrs: 2,
+        activeCodingHours: 20,
+        offHoursRatio: 0.4,
+        velocityAcceleration: 0.1,
+        equivalentEngineeringHours: 44,
+      },
+      windows: [],
+    });
 
     const response = await app.request(
       'http://localhost/api/scan',
@@ -253,11 +334,82 @@ describe('worker routes', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ repoUrl: 'https://github.com/acme/repo' }),
       },
-      { DB: {} as D1Database, GITHUB_TOKEN: undefined },
+      { DB: {} as D1Database, GITHUB_TOKEN: undefined, SESSION_SECRET: 'session-secret' },
     );
 
     expect(response.status).toBe(200);
-    expect(persistScanReportMock).toHaveBeenCalledTimes(1);
+    expect(persistScanReportMock).not.toHaveBeenCalled();
+    const body = (await response.json()) as { persistence?: { canonicalLeaderboardWrite?: boolean; reason?: string } };
+    expect(body.persistence?.canonicalLeaderboardWrite).toBe(false);
+    expect(body.persistence?.reason).toBe('unauthenticated');
+  });
+
+  it('does not persist scan result when authenticated handle does not own scanned repo', async () => {
+    scanRepoByUrlMock.mockResolvedValue({
+      repo: { owner: 'acme', name: 'repo', url: 'https://github.com/acme/repo' },
+      scannedAt: '2026-02-27T00:00:00.000Z',
+      attribution: {
+        mode: 'repo-wide',
+        source: 'github-author-login-match',
+        strict: false,
+        productionReady: true,
+        notes: 'repo-wide fallback',
+      },
+      assumptions: {
+        offHoursDefinitionUtc: 'off-hours',
+        equivalentEngineeringHoursFormula: 'eeh formula',
+        defaultBranchScope: 'Merged PRs were evaluated only when targeting the repository default branch.',
+        ciVerification: 'CI-verified merged PRs require merge commit SHA plus passing checks.',
+      },
+      metrics: {
+        commitsPerDay: 1,
+        mergedPrsUnverified: 3,
+        mergedPrsCiVerified: 2,
+        mergedPrs: 2,
+        activeCodingHours: 20,
+        offHoursRatio: 0.4,
+        velocityAcceleration: 0.1,
+        equivalentEngineeringHours: 44,
+      },
+      windows: [],
+    });
+    getSessionIdentityByTokenHashMock.mockResolvedValueOnce({
+      sessionId: 'sess-1',
+      handle: 'other-user',
+      userId: 1,
+      expiresAt: '2026-03-15T00:00:00.000Z',
+      provider: 'github',
+      providerLogin: 'other-user',
+      providerUserId: '101',
+      avatarUrl: null,
+      profileUrl: null,
+    });
+
+    const response = await app.request(
+      'http://localhost/api/scan',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          cookie: 'velocity_session=abc123',
+        },
+        body: JSON.stringify({ repoUrl: 'https://github.com/acme/repo' }),
+      },
+      {
+        DB: {} as D1Database,
+        GITHUB_TOKEN: undefined,
+        SESSION_SECRET: 'session-secret',
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(persistScanReportMock).not.toHaveBeenCalled();
+    const body = (await response.json()) as {
+      persistence?: { canonicalLeaderboardWrite?: boolean; reason?: string; actorHandle?: string };
+    };
+    expect(body.persistence?.canonicalLeaderboardWrite).toBe(false);
+    expect(body.persistence?.reason).toBe('owner-mismatch');
+    expect(body.persistence?.actorHandle).toBe('other-user');
   });
 
   it('returns explicit missing-env error for GitHub OAuth start', async () => {
@@ -285,6 +437,61 @@ describe('worker routes', () => {
     });
 
     expect(response.status).toBe(400);
+  });
+
+  it('returns 400 when OAuth callback state cookie does not match query state', async () => {
+    const response = await app.request(
+      'http://localhost/api/auth/github/callback?code=oauth-code&state=expected-state',
+      {
+        headers: { cookie: 'velocity_oauth_state=different-state' },
+      },
+      {
+        DB: {} as D1Database,
+        APP_ENV: 'development',
+        GITHUB_CLIENT_ID: 'id',
+        GITHUB_CLIENT_SECRET: 'secret',
+        SESSION_SECRET: 'session-secret',
+        OAUTH_TOKEN_ENCRYPTION_KEY,
+      },
+    );
+
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error?: string };
+    expect(body.error).toBe('OAuth state cookie mismatch.');
+  });
+
+  it('returns 400 when OAuth callback state signature is tampered', async () => {
+    const baseEnv = {
+      DB: {} as D1Database,
+      APP_ENV: 'development' as const,
+      GITHUB_CLIENT_ID: 'id',
+      GITHUB_CLIENT_SECRET: 'secret',
+      SESSION_SECRET: 'session-secret',
+      OAUTH_TOKEN_ENCRYPTION_KEY,
+    };
+
+    const startResponse = await app.request('http://localhost/api/auth/github/start', undefined, baseEnv);
+    expect(startResponse.status).toBe(302);
+
+    const authorizeLocation = startResponse.headers.get('location');
+    const issuedState = new URL(authorizeLocation as string).searchParams.get('state');
+    expect(issuedState).toBeTruthy();
+
+    const [encodedPayload, signature] = (issuedState as string).split('.');
+    const tamperedSignature = `${signature.slice(0, -1)}${signature.endsWith('0') ? '1' : '0'}`;
+    const tamperedState = `${encodedPayload}.${tamperedSignature}`;
+
+    const callbackResponse = await app.request(
+      `http://localhost/api/auth/github/callback?code=oauth-code&state=${encodeURIComponent(tamperedState)}`,
+      {
+        headers: { cookie: `velocity_oauth_state=${tamperedState}` },
+      },
+      baseEnv,
+    );
+
+    expect(callbackResponse.status).toBe(400);
+    const body = (await callbackResponse.json()) as { error?: string };
+    expect(body.error).toContain('signature mismatch');
   });
 
   it('redirects OAuth callback to /v/:handle by default', async () => {

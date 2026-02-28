@@ -256,11 +256,14 @@ function computePercentile(rank: number, totalRows: number): number {
   if (totalRows <= 1) {
     return 100;
   }
-  return round2((1 - (rank - 1) / (totalRows - 1)) * 100);
+
+  const boundedRank = Math.min(Math.max(Math.floor(rank), 1), totalRows);
+  return round2((1 - (boundedRank - 1) / (totalRows - 1)) * 100);
 }
 
 async function upsertLeaderboardRow(db: D1Database, userId: number, entry: LeaderboardEntry): Promise<void> {
   const attribution = normalizeAttribution(entry.attribution);
+  const rank = Math.max(1, Math.floor(entry.rank));
   await db
     .prepare(
       `INSERT INTO leaderboard_rows (
@@ -306,7 +309,7 @@ async function upsertLeaderboardRow(db: D1Database, userId: number, entry: Leade
     )
     .bind(
       userId,
-      entry.rank,
+      rank,
       entry.scannedRepos,
       entry.featuredRepo ?? null,
       entry.aiReadyScore ?? null,
@@ -325,6 +328,143 @@ async function upsertLeaderboardRow(db: D1Database, userId: number, entry: Leade
       attribution.strict ? 1 : 0,
     )
     .run();
+}
+
+async function recomputeLeaderboardRanks(db: D1Database): Promise<void> {
+  await db
+    .prepare(
+      `WITH ranked AS (
+         SELECT
+           lr.user_id,
+           ROW_NUMBER() OVER (
+             ORDER BY
+               lr.total_equivalent_engineering_hours DESC,
+               lr.total_merged_prs_ci_verified DESC,
+               lr.total_merged_prs DESC,
+               lower(u.handle) ASC
+           ) AS computed_rank
+         FROM leaderboard_rows lr
+         INNER JOIN users u ON u.id = lr.user_id
+       )
+       UPDATE leaderboard_rows
+       SET rank = (
+             SELECT computed_rank
+             FROM ranked
+             WHERE ranked.user_id = leaderboard_rows.user_id
+           ),
+           updated_at = CURRENT_TIMESTAMP
+       WHERE user_id IN (SELECT user_id FROM ranked)`,
+    )
+    .run();
+}
+
+interface AggregatedScanMetricsRow {
+  scanned_repos: number;
+  featured_repo: string | null;
+  attribution_mode: string;
+  attribution_source: string;
+  attribution_target_handle: string | null;
+  attribution_strict: number;
+  total_equivalent_engineering_hours: number;
+  total_merged_prs_unverified: number;
+  total_merged_prs_ci_verified: number;
+  total_merged_prs: number;
+  total_commits_per_day: number;
+  total_active_coding_hours: number;
+  total_off_hours_ratio: number;
+  total_velocity_acceleration: number;
+}
+
+async function aggregateLatestScanMetricsForUser(
+  db: D1Database,
+  userId: number,
+): Promise<AggregatedScanMetricsRow | null> {
+  return db
+    .prepare(
+      `WITH latest_repo_scans AS (
+         SELECT
+           s.repo_id,
+           s.commits_per_day,
+           s.merged_prs_unverified,
+           s.merged_prs_ci_verified,
+           s.merged_prs,
+           s.active_coding_hours,
+           s.off_hours_ratio,
+           s.velocity_acceleration,
+           s.equivalent_engineering_hours,
+           ROW_NUMBER() OVER (
+             PARTITION BY s.repo_id
+             ORDER BY datetime(s.scanned_at) DESC, s.id DESC
+           ) AS repo_rank
+         FROM snapshots s
+         WHERE s.user_id = ?
+           AND s.snapshot_type = 'scan'
+           AND s.repo_id IS NOT NULL
+       ),
+       latest_user_scan AS (
+         SELECT
+           s.attribution_mode,
+           s.attribution_source,
+           s.attributed_handle,
+           s.attribution_strict
+         FROM snapshots s
+         WHERE s.user_id = ?
+           AND s.snapshot_type = 'scan'
+         ORDER BY datetime(s.scanned_at) DESC, s.id DESC
+         LIMIT 1
+       ),
+       latest_featured_repo AS (
+         SELECT r.url AS featured_repo
+         FROM snapshots s
+         INNER JOIN repos r ON r.id = s.repo_id
+         WHERE s.user_id = ?
+           AND s.snapshot_type = 'scan'
+           AND s.repo_id IS NOT NULL
+         ORDER BY datetime(s.scanned_at) DESC, s.id DESC
+         LIMIT 1
+       )
+       SELECT
+         COALESCE(COUNT(*), 0) AS scanned_repos,
+         (SELECT featured_repo FROM latest_featured_repo) AS featured_repo,
+         COALESCE((SELECT attribution_mode FROM latest_user_scan), 'repo-wide') AS attribution_mode,
+         COALESCE((SELECT attribution_source FROM latest_user_scan), 'github-author-login-match') AS attribution_source,
+         (SELECT attributed_handle FROM latest_user_scan) AS attribution_target_handle,
+         COALESCE((SELECT attribution_strict FROM latest_user_scan), 0) AS attribution_strict,
+         COALESCE(SUM(lrs.equivalent_engineering_hours), 0) AS total_equivalent_engineering_hours,
+         COALESCE(SUM(lrs.merged_prs_unverified), 0) AS total_merged_prs_unverified,
+         COALESCE(SUM(lrs.merged_prs_ci_verified), 0) AS total_merged_prs_ci_verified,
+         COALESCE(SUM(lrs.merged_prs), 0) AS total_merged_prs,
+         COALESCE(AVG(lrs.commits_per_day), 0) AS total_commits_per_day,
+         COALESCE(AVG(lrs.active_coding_hours), 0) AS total_active_coding_hours,
+         COALESCE(AVG(lrs.off_hours_ratio), 0) AS total_off_hours_ratio,
+         COALESCE(AVG(lrs.velocity_acceleration), 0) AS total_velocity_acceleration
+       FROM latest_repo_scans lrs
+       WHERE lrs.repo_rank = 1`,
+    )
+    .bind(userId, userId, userId)
+    .first<AggregatedScanMetricsRow>();
+}
+
+async function getCurrentRankAndTotalRows(
+  db: D1Database,
+  userId: number,
+): Promise<{ rank: number; totalRows: number }> {
+  const row = await db
+    .prepare(
+      `SELECT
+         rank,
+         (SELECT COUNT(*) FROM leaderboard_rows) AS total_rows
+       FROM leaderboard_rows
+       WHERE user_id = ?
+       LIMIT 1`,
+    )
+    .bind(userId)
+    .first<{ rank: number; total_rows: number }>();
+
+  return {
+    rank: Math.max(1, toNumber(row?.rank, 1)),
+    totalRows: Math.max(1, toNumber(row?.total_rows, 1)),
+  };
 }
 
 async function insertCrown(db: D1Database, userId: number, key: string, label: string, awardedAt: string): Promise<void> {
@@ -441,6 +581,7 @@ export async function persistLeaderboardArtifact(
   }
 
   if (!options?.pruneRowsOutsideArtifact) {
+    await recomputeLeaderboardRanks(db);
     return;
   }
 
@@ -454,6 +595,8 @@ export async function persistLeaderboardArtifact(
     .prepare(`DELETE FROM leaderboard_rows WHERE user_id NOT IN (${placeholders})`)
     .bind(...persistedUserIds)
     .run();
+
+  await recomputeLeaderboardRanks(db);
 }
 
 export async function ensureSeedData(db: D1Database, artifact: LeaderboardArtifact): Promise<void> {
@@ -725,46 +868,48 @@ export async function persistScanReport(db: D1Database, report: RepoReportCard):
     await insertScanDetails(db, snapshotId, report);
   }
 
-  const existingRow = await db
-    .prepare('SELECT user_id FROM leaderboard_rows WHERE user_id = ?')
-    .bind(userId)
-    .first<{ user_id: number }>();
-
-  if (!existingRow) {
-    const inferredEntry: LeaderboardEntry = {
-      rank: 0,
-      handle: report.repo.owner,
-      scannedRepos: 1,
-      featuredRepo: report.repo.url,
-      scanInsight: 'Live scan ingestion from /api/scan.',
-      attribution: report.attribution,
-      totals: {
-        equivalentEngineeringHours: report.metrics.equivalentEngineeringHours,
-        mergedPrsUnverified: report.metrics.mergedPrsUnverified,
-        mergedPrsCiVerified: report.metrics.mergedPrsCiVerified,
-        mergedPrs: report.metrics.mergedPrs,
-        commitsPerDay: report.metrics.commitsPerDay,
-        activeCodingHours: report.metrics.activeCodingHours,
-        offHoursRatio: report.metrics.offHoursRatio,
-        velocityAcceleration: report.metrics.velocityAcceleration,
-      },
-      repos: [],
-    };
-
-    await upsertLeaderboardRow(db, userId, inferredEntry);
-    await insertHistoryPoint(
-      db,
-      userId,
-      report.scannedAt,
-      inferredEntry.rank,
-      0,
-      report.metrics.equivalentEngineeringHours,
-      report.metrics.mergedPrs,
-      report.metrics.commitsPerDay,
-      report.metrics.activeCodingHours,
-      undefined,
-    );
+  const aggregate = await aggregateLatestScanMetricsForUser(db, userId);
+  if (!aggregate) {
+    return;
   }
+
+  const handleRow = await db.prepare('SELECT handle FROM users WHERE id = ?').bind(userId).first<{ handle: string }>();
+  const inferredEntry: LeaderboardEntry = {
+    rank: 1,
+    handle: toStringValue(handleRow?.handle, report.repo.owner),
+    scannedRepos: Math.max(1, Math.round(toNumber(aggregate.scanned_repos, 1))),
+    featuredRepo: aggregate.featured_repo ?? report.repo.url,
+    scanInsight: 'Live scan ingestion from /api/scan.',
+    attribution: parseAttributionFromRow(aggregate),
+    totals: {
+      equivalentEngineeringHours: round2(toNumber(aggregate.total_equivalent_engineering_hours)),
+      mergedPrsUnverified: Math.round(toNumber(aggregate.total_merged_prs_unverified)),
+      mergedPrsCiVerified: Math.round(toNumber(aggregate.total_merged_prs_ci_verified)),
+      mergedPrs: Math.round(toNumber(aggregate.total_merged_prs)),
+      commitsPerDay: round2(toNumber(aggregate.total_commits_per_day)),
+      activeCodingHours: round2(toNumber(aggregate.total_active_coding_hours)),
+      offHoursRatio: round2(toNumber(aggregate.total_off_hours_ratio)),
+      velocityAcceleration: round2(toNumber(aggregate.total_velocity_acceleration)),
+    },
+    repos: [],
+  };
+
+  await upsertLeaderboardRow(db, userId, inferredEntry);
+  await recomputeLeaderboardRanks(db);
+
+  const { rank, totalRows } = await getCurrentRankAndTotalRows(db, userId);
+  await insertHistoryPoint(
+    db,
+    userId,
+    report.scannedAt,
+    rank,
+    computePercentile(rank, totalRows),
+    inferredEntry.totals.equivalentEngineeringHours,
+    inferredEntry.totals.mergedPrs,
+    inferredEntry.totals.commitsPerDay,
+    inferredEntry.totals.activeCodingHours,
+    undefined,
+  );
 }
 
 interface LeaderboardSqlRow {
@@ -865,8 +1010,9 @@ export async function getLeaderboardArtifact(db: D1Database): Promise<Leaderboar
   const rows = rowsResult.results ?? [];
   const crownsByHandle = await loadCrownsByHandle(db);
 
-  const entries: LeaderboardEntry[] = rows.map((row) => {
-    const rank = toNumber(row.rank);
+  const entries: LeaderboardEntry[] = rows.map((row, index) => {
+    const fallbackRank = index + 1;
+    const rank = Math.min(Math.max(1, Math.round(toNumber(row.rank, fallbackRank))), rows.length || fallbackRank);
     const totalEeh = toNumber(row.total_equivalent_engineering_hours);
     const handle = toStringValue(row.handle);
     const normalizedHandle = handle.toLowerCase();
@@ -996,7 +1142,7 @@ export async function getProfileByHandle(db: D1Database, handle: string): Promis
     }>();
 
   const totalRows = Math.max(1, toNumber(row.total_rows, 1));
-  const rank = toNumber(row.rank);
+  const rank = Math.min(Math.max(1, Math.round(toNumber(row.rank, 1))), totalRows);
   const totalEeh = toNumber(row.total_equivalent_engineering_hours);
   const percentile = computePercentile(rank, totalRows);
   const stackTier = inferOperatingStackTier({

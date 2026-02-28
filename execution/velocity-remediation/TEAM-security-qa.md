@@ -1,7 +1,7 @@
 # Team: Security / QA
 
-Owner: TBD  
-Status: TODO
+Owner: Carson  
+Status: IN_PROGRESS
 
 ## Scope
 
@@ -29,8 +29,8 @@ Guidance:
 - move to timing-safe comparison for secret-derived values.
 
 Acceptance Criteria:
-- [ ] direct secret/state equality checks removed
-- [ ] tests cover mismatch behavior
+- [x] direct secret/state equality checks removed
+- [x] tests cover mismatch behavior
 
 ### VEL-018 (Medium) Missing integration coverage on ranking/persistence SQL
 
@@ -64,15 +64,15 @@ Guidance:
 - add scenario tests around heavy repo activity, fallback paths, and window boundaries.
 
 Acceptance Criteria:
-- [ ] e2e-like scenarios for attribution and time-window edges are covered
-- [ ] CI output includes these test groups
+- [x] e2e-like scenarios for attribution and time-window edges are covered
+- [x] CI output includes these test groups
 
 ## Checklist
 
-- [ ] VEL-017 fixed
+- [x] VEL-017 fixed
 - [ ] VEL-018 fixed
-- [ ] VEL-019 fixed
-- [ ] test reports attached
+- [x] VEL-019 fixed
+- [x] test reports attached
 - [ ] sign-off posted in `COMMS.md`
 
 ## Dependencies / Requests To Other Teams
@@ -91,7 +91,20 @@ Validation:
 Open questions:
 ```
 
+Date: 2026-02-28  
+Engineer: Carson  
+Tasks touched: VEL-017, VEL-018, VEL-019  
+What changed:  
+- Hardened OAuth state checks in `apps/velocity-mvp/src/worker/index.ts` with timing-safe comparison utility (signature and cookie-state checks).  
+- Added OAuth mismatch regression tests in `apps/velocity-mvp/src/worker/index.test.ts`.  
+- Added local-D1 integration suite in `apps/velocity-mvp/src/worker/data/db.integration.test.ts` (first scan, repeat persistence update, rank ordering/percentile bounds, refresh-run links) with explicit VEL-001/002 regression guards.  
+- Added attribution/window edge scenarios in `apps/velocity-mvp/src/shared/scanService.test.ts` (strict handle mode, fallback mode, heavy activity + default-branch fallback assumptions).  
+Validation:  
+- `npx vitest run src/worker/index.test.ts src/shared/scanService.test.ts` -> PASS (31 tests).  
+- Local D1 integration suite requires loopback listener access; elevated run request was interrupted/rejected and is pending re-run.  
+Open questions:  
+- Backend/Data confirmation requested in `COMMS.md` for canonical fixture expectations covering VEL-001/002 edge outcomes.
+
 ## Notes To Future Contributors
 
 Use this section for known test blind spots and future hardening recommendations.
-
