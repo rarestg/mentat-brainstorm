@@ -18,6 +18,7 @@ The thinking evolved in layers: Notion raw notes → standalone essays → long-
 
 ```
 spec/                              # Product specs (the polished, current source of truth)
+  mentat-doctrine.md               #   Canonical product doctrine (thesis, principles, decision rules)
   mentat-scan.md                   #   Mentat Scan — 6 Protocols, scoring, scanner architecture
   mentat-velocity.md               #   Mentat Velocity — Leaderboard, crowns, profile page, GTM
 
@@ -77,5 +78,6 @@ _archive/                          # Superseded earlier drafts
 ## Status
 
 Pre-development. Brainstorming and spec-writing phase. Start here:
+- [`spec/mentat-doctrine.md`](spec/mentat-doctrine.md) — canonical doctrine (mission, principles, loop)
 - [`spec/mentat-scan.md`](spec/mentat-scan.md) — the scanner product spec
 - [`spec/mentat-velocity.md`](spec/mentat-velocity.md) — the leaderboard product spec

@@ -1,0 +1,58 @@
+name = "velocity-mvp"
+main = "src/worker/index.ts"
+compatibility_date = "2026-02-27"
+workers_dev = true
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+
+[vars]
+APP_ENV = "development"
+SESSION_TTL_HOURS = "336"
+REFRESH_ADMIN_HANDLES = ""
+
+[[d1_databases]]
+binding = "DB"
+database_name = "velocity-mvp-dev"
+database_id = "8c3ad569-02c1-4b5f-90c4-32d7c96f63e6"
+migrations_dir = "migrations"
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[env.staging]
+name = "velocity-mvp-staging"
+
+[env.staging.vars]
+APP_ENV = "staging"
+SESSION_TTL_HOURS = "336"
+REFRESH_ADMIN_HANDLES = "gregeames123"
+
+[env.staging.triggers]
+crons = ["17 3 * * *"]
+
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "velocity-mvp-staging"
+database_id = "26dda200-c3d6-4afd-ab9e-b53fc53bd88b"
+migrations_dir = "migrations"
+
+[env.production]
+name = "velocity-mvp-production"
+workers_dev = true
+
+[env.production.vars]
+APP_ENV = "production"
+SESSION_TTL_HOURS = "336"
+REFRESH_ADMIN_HANDLES = "gregeames123"
+
+[env.production.triggers]
+crons = ["17 3 * * *"]
+
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "velocity-mvp-production"
+database_id = "407e0bba-bd55-4ec8-ae89-6fe2122b1213"
+migrations_dir = "migrations"

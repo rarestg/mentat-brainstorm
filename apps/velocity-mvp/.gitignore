@@ -1,0 +1,9 @@
+node_modules
+dist
+.coverage
+.wrangler
+.env
+.env.local
+.env.*.local
+.dev.vars
+.dev.vars.*

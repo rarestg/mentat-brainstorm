@@ -1,0 +1,18 @@
+[
+  {
+    "handle": "sindresorhus",
+    "featuredRepos": [
+      "https://github.com/sindresorhus/awesome",
+      "https://github.com/sindresorhus/meta"
+    ]
+  },
+  {
+    "handle": "rauchg",
+    "featuredRepos": [
+      "https://github.com/vercel/next.js"
+    ]
+  },
+  {
+    "handle": "kentcdodds"
+  }
+]
