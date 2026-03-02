@@ -42,11 +42,11 @@ Refs:
 - `apps/velocity-mvp/src/worker/data/db.ts:1256`
 
 Acceptance Criteria:
-- [ ] automated test verifies manual canonical rows survive refresh
+- [x] automated test verifies manual canonical rows survive refresh
 - [x] test asserts no data loss after failed/partial refresh attempt where applicable
 
 Status:
-- BLOCKED on W2-001 implementation (preservation regression is red by design until fix lands)
+- DONE after W2-001 landed; regression now passes in full suite.
 
 ### W2-020 (High) Missing scenario coverage for challenge + canonical policy behavior
 
@@ -68,7 +68,7 @@ Status:
 ## Checklist
 
 - [x] W2-018 fixed
-- [ ] W2-019 fixed
+- [x] W2-019 fixed
 - [ ] W2-020 fixed
 - [ ] full verification report posted
 
@@ -92,6 +92,17 @@ Validation:
 Open questions:
 - Product Loop: confirm challenge deep-link landing contract (`?challenge=` parse target + signed-out behavior) to finalize W2-020 challenge coverage.
 - Data Integrity: confirm canonical persistence gating contract for strict attribution and canonical-owner identity fields/reason codes.
+
+Date: 2026-03-02
+Engineer: Program follow-up
+Tasks touched: W2-019
+What changed:
+- Revalidated QA lane after Data Integrity + Product/Growth + Platform merges.
+- W2-019 regression now passes in full suite.
+Validation:
+- `npm run check` (pass; 79 tests passed, 1 todo pending W2-020 challenge coverage).
+Open questions:
+- None for W2-019.
 
 ## Notes To Future Contributors
 

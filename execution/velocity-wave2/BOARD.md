@@ -44,7 +44,7 @@ Primary outcomes:
 | W2-016 | Low | Growth UX | Mobile share/challenge control sizing reduces tap success | Sagan | DONE | None |
 | W2-017 | Medium | Growth UX | Return loop relies on local-only streak/delta (no server-backed rivalry progression) | Sagan | DONE | W2-002 |
 | W2-018 | Medium | QA Verification | Integration harness does not apply migration `0003` | Carson | DONE | None |
-| W2-019 | Medium | QA Verification | Missing regression for refresh preserving manual scan entrants | Carson | BLOCKED | W2-001 |
+| W2-019 | Medium | QA Verification | Missing regression for refresh preserving manual scan entrants | Carson | DONE | W2-001 |
 | W2-020 | High | QA Verification | Missing scenario coverage for challenge loop + canonical policy behavior | Carson | BLOCKED | W2-002, W2-005, W2-006 |
 
 ## Release Gates
@@ -62,9 +62,9 @@ Primary outcomes:
 |---|---:|---:|
 | Critical done | 2 | 2 |
 | High done | 9 | 5 |
-| Medium done | 9 | 8 |
+| Medium done | 9 | 9 |
 | Low done | 1 | 1 |
-| Total done | 20 | 16 |
+| Total done | 20 | 17 |
 
 ## Standup Template
 
