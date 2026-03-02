@@ -34,34 +34,34 @@ Primary outcomes:
 | VEL-008 | High | Product/UX/Growth | placeholder/synthetic profile blocks weaken trust | Hegel | DONE | VEL-001, VEL-002, VEL-003 |
 | VEL-009 | High | Product/UX/Growth | weak return loop (not Strava-sticky) | Hegel | DONE | VEL-006 |
 | VEL-010 | Medium | Product/UX/Growth | profile loading false negative + mobile comparison gaps | Hegel | DONE | None |
-| VEL-011 | High | Platform | wrangler v3 drift vs current v4 | Curie | IN_PROGRESS | None |
+| VEL-011 | High | Platform | wrangler v3 drift vs current v4 | Curie | DONE | None |
 | VEL-012 | High | Platform | root deploy footgun (non-`--env` publishes unintended worker) | Curie | DONE | None |
 | VEL-013 | Medium | Platform | D1 migration targets binding alias not DB names | Curie | DONE | VEL-011 |
 | VEL-014 | Medium | Platform | no shared cache and weak edge caching for read APIs | Curie | DONE | VEL-001, VEL-002 |
 | VEL-015 | Medium | Platform | overlapping refresh runs (no serialization lock) | Curie | DONE | VEL-001, VEL-002 |
 | VEL-016 | Medium | Platform | missing D1 retention/cleanup policy | Curie | DONE | None |
 | VEL-017 | Low | Security | timing-safe compare missing for OAuth state | Carson | DONE | None |
-| VEL-018 | Medium | QA | missing DB integration coverage for ranking/persistence | Carson | IN_PROGRESS | VEL-001, VEL-002, VEL-003 |
+| VEL-018 | Medium | QA | missing DB integration coverage for ranking/persistence | Carson | DONE | VEL-001, VEL-002, VEL-003 |
 | VEL-019 | Low | QA | limited end-to-end coverage for attribution/window edges | Carson | DONE | VEL-003 |
 
 ## Release Gates
 
-- [ ] Gate A: all `Critical` items marked `DONE`
-- [ ] Gate B: all `High` data trust items (`VEL-001`, `VEL-002`, `VEL-003`) marked `DONE`
-- [ ] Gate C: integration tests for ranking/persistence merged
-- [ ] Gate D: staging smoke pass recorded
-- [ ] Gate E: production deploy + smoke pass recorded
-- [ ] Gate F: growth loop MVP (`claim`, `share`, `compare`) live
+- [x] Gate A: all `Critical` items marked `DONE`
+- [x] Gate B: all `High` data trust items (`VEL-001`, `VEL-002`, `VEL-003`) marked `DONE`
+- [x] Gate C: integration tests for ranking/persistence merged
+- [x] Gate D: staging smoke pass recorded
+- [x] Gate E: production deploy + smoke pass recorded
+- [x] Gate F: growth loop MVP (`claim`, `share`, `compare`) live
 
 ## Progress Tracker
 
 | Metric | Target | Current |
 |---|---:|---:|
 | Critical done | 2 | 2 |
-| High done | 7 | 5 |
-| Medium done | 8 | 3 |
-| Low done | 2 | 0 |
-| Total done | 19 | 10 |
+| High done | 7 | 7 |
+| Medium done | 8 | 8 |
+| Low done | 2 | 2 |
+| Total done | 19 | 19 |
 
 ## Standup Update Template
 

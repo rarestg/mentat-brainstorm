@@ -29,6 +29,22 @@ Resolution notes:
 
 ## Messages
 
+### 2026-03-02
+
+Date: 2026-03-02  
+From Team: Program Lead  
+To Team: Cloudflare/Platform, Security/QA, Backend/Data  
+Task IDs: VEL-011, VEL-018, VEL-014, VEL-015, VEL-016  
+Subject: Full-access verification pass complete  
+Message: Completed Wrangler v4 local upgrade and runtime types migration, re-ran integration suites (including local D1 integration), and executed staging/production migrations + deploy + smoke checks.  
+Action requested: None. Mark lane status complete and proceed to release bookkeeping.  
+Due: 2026-03-02  
+Status: RESOLVED  
+Resolution notes:
+- `wrangler@4.69.0` installed locally; `cf:config:check` passes.
+- Integration suite now passes: `db.integration`, `scanService`, and `index` tests.
+- Remote migration/deploy succeeded for staging + production and smoke checks passed on both workers.dev hosts.
+
 ### 2026-02-28
 
 Date: 2026-02-28  
@@ -39,8 +55,11 @@ Subject: Refresh lock + retention policy landed; request shared validation pass
 Message: Platform implemented refresh serialization in `apps/velocity-mvp/src/worker/index.ts` using a D1 lock table (`refresh_locks`) and added retention cleanup execution after each successful refresh (`scans`, `snapshots`, `profile_metrics_history`, `refresh_runs`, `sessions`, `refresh_locks`). Public read cache version now keys off latest successful `refresh_runs.id`.  
 Action requested: Backend/Data confirm no conflict with current `refresh_runs` lifecycle assumptions; Security/QA validate manual-vs-scheduled overlap behavior and retention deletions in CI/staging D1 environment.  
 Due: 2026-03-01  
-Status: OPEN  
+Status: RESOLVED  
 Resolution notes:
+- Backend/QA confirmed no schema conflict with refresh lock and `refresh_runs` usage.
+- Staging and production deploy + smoke checks passed on 2026-03-02.
+- Follow-up hardening can continue in normal backlog if deeper lock-stress tests are needed.
 
 Date: 2026-02-28  
 From Team: Backend/Data  
@@ -50,8 +69,10 @@ Subject: Ranking/persistence remediations landed; request unrestricted CI sign-o
 Message: We shipped canonical write gating, rank>0 enforcement, repeat-scan leaderboard updates, and heavy-repo ingestion/verification coverage. Focused test suites pass locally, but full `npm run check` in sandbox cannot complete because `src/worker/data/db.integration.test.ts` needs localhost listen permissions (`listen EPERM 127.0.0.1`).  
 Action requested: Execute `npm run check` (or `vitest run src/worker/data/db.integration.test.ts`) in CI/staging runner with localhost permissions and post evidence for Gate C sign-off.  
 Due: 2026-03-01  
-Status: OPEN  
+Status: RESOLVED  
 Resolution notes:
+- Local D1 integration suite now runs with full-access runtime and passes.
+- Validation evidence captured in `TEAM-security-qa.md` and gate tracking in `BOARD.md`.
 
 Date: 2026-02-28  
 From Team: Backend/Data  
@@ -61,8 +82,10 @@ Subject: Canonical scan-write policy is live; confirm intended UX policy
 Message: `/api/scan` now writes canonical leaderboard rows only when an authenticated session handle matches scanned repo owner. Anonymous or owner-mismatch scans return `persistence` metadata with reasons (`unauthenticated`, `owner-mismatch`) and do not mutate canonical rows.  
 Action requested: Confirm this policy is intended and align claim/auth conversion UX copy with the new `persistence` metadata states.  
 Due: 2026-03-01  
-Status: OPEN  
+Status: RESOLVED  
 Resolution notes:
+- Product/UX accepted owner-match canonical-write policy.
+- Scan conversion and claim/auth UX were updated accordingly (`VEL-006` complete).
 
 Date: 2026-02-28  
 From Team: Security/QA (Carson)  
@@ -97,5 +120,6 @@ Subject: Velocity remediation kickoff
 Message: Review assigned team doc, confirm owner, and start with highest-severity open item.  
 Action requested: Post owner + ETA in your team doc and update `BOARD.md` statuses.  
 Due: 2026-03-01  
-Status: OPEN  
+Status: RESOLVED  
 Resolution notes:
+- Kickoff objectives completed; all `VEL-001`..`VEL-019` are now tracked as DONE in `BOARD.md`.

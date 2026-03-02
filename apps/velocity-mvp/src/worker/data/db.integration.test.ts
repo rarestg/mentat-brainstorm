@@ -13,12 +13,28 @@ import { getLeaderboardArtifact, persistLeaderboardArtifact, persistScanReport, 
 
 const buildLeaderboardMock = vi.mocked(buildLeaderboard);
 
-async function loadMigrationSql(): Promise<string> {
+function splitSqlStatements(sql: string): string[] {
+  return sql
+    .replace(/^PRAGMA\s+[^;]+;\s*$/gim, '')
+    .split(';')
+    .map((statement) => statement.replace(/\s+/g, ' ').trim())
+    .filter((statement) => statement.length > 0)
+    .map((statement) => `${statement};`);
+}
+
+async function loadMigrationStatements(): Promise<string[]> {
   const [schemaSql, authSql] = await Promise.all([
     readFile(new URL('../../../migrations/0001_velocity_schema.sql', import.meta.url), 'utf8'),
     readFile(new URL('../../../migrations/0002_auth_identity_refresh.sql', import.meta.url), 'utf8'),
   ]);
-  return `${schemaSql}\n${authSql}`;
+  return [...splitSqlStatements(schemaSql), ...splitSqlStatements(authSql)];
+}
+
+async function applyMigrations(db: D1Database): Promise<void> {
+  const statements = await loadMigrationStatements();
+  for (const statement of statements) {
+    await db.exec(statement);
+  }
 }
 
 async function createLocalD1Database(): Promise<{ mf: Miniflare; db: D1Database }> {
@@ -31,7 +47,7 @@ async function createLocalD1Database(): Promise<{ mf: Miniflare; db: D1Database 
     port: 0,
   });
   const db = await mf.getD1Database('DB');
-  await db.exec(await loadMigrationSql());
+  await applyMigrations(db);
   return { mf, db };
 }
 
@@ -80,7 +96,7 @@ function artifactFixture(entries: LeaderboardArtifact['entries']): LeaderboardAr
 }
 
 describe('worker data integration (local D1)', () => {
-  let mf: Miniflare;
+  let mf: Miniflare | undefined;
   let db: D1Database;
 
   beforeEach(async () => {
@@ -91,7 +107,9 @@ describe('worker data integration (local D1)', () => {
   });
 
   afterEach(async () => {
-    await mf.dispose();
+    if (mf) {
+      await mf.dispose();
+    }
   });
 
   it('persists first scan report into snapshots, scans, and leaderboard tables', async () => {
@@ -112,7 +130,7 @@ describe('worker data integration (local D1)', () => {
     expect(Number(snapshotCount?.count ?? 0)).toBe(1);
     expect(Number(scanCount?.count ?? 0)).toBe(1);
     expect(leaderboardRow).toMatchObject({
-      rank: 0,
+      rank: 1,
       scanned_repos: 1,
       total_equivalent_engineering_hours: 91.2,
     });
@@ -359,7 +377,7 @@ describe('worker data integration (local D1)', () => {
     expect(result.trigger).toBe('manual');
   });
 
-  it.fails('VEL-001 guard: percentile must stay <= 100 even when manual scan rows are present', async () => {
+  it('VEL-001 guard: percentile must stay <= 100 even when manual scan rows are present', async () => {
     await persistLeaderboardArtifact(
       db,
       artifactFixture([
@@ -405,7 +423,7 @@ describe('worker data integration (local D1)', () => {
     expect(Math.max(...artifact.entries.map((entry) => entry.percentile ?? 0))).toBeLessThanOrEqual(100);
   });
 
-  it.fails('VEL-002 guard: repeat manual scan should refresh leaderboard totals for the same handle', async () => {
+  it('VEL-002 guard: repeat manual scan should refresh leaderboard totals for the same handle', async () => {
     await persistScanReport(db, reportFixture());
     await persistScanReport(
       db,

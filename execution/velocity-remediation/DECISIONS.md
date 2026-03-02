@@ -28,6 +28,30 @@ Follow-up actions:
 
 ## Decisions
 
+### DEC-006
+
+Decision ID: DEC-006  
+Date: 2026-03-02  
+Owner: Program Lead  
+Related Tasks: VEL-011, VEL-018  
+Context: Closing final blockers required moving from wrapper-based Wrangler v4 execution to stable local v4 dependency and resolving failing local-D1 integration harness behavior.  
+Decision:
+- Promote Wrangler v4 to the installed local toolchain (`wrangler@4.69.0`) and run scripts against local binary.
+- Adopt runtime-generated Worker types as primary source and remove `@cloudflare/workers-types` from `tsconfig` dependency path.
+- Stabilize local-D1 integration setup by normalizing migration SQL execution in tests (statement-by-statement execution and PRAGMA stripping for Miniflare compatibility).
+Alternatives considered:
+- Keep v3 dependency and use `npm exec wrangler@4` wrapper indefinitely
+- Skip local integration harness and rely on CI-only coverage
+Tradeoffs:
+- Local v4 dependency gives deterministic tooling and fewer network/runtime surprises.
+- Runtime-generated types add a large generated file diff but improve correctness alignment with deployed runtime.
+- Miniflare-compatible migration execution is test-harness specific and should remain isolated to tests.
+Implementation notes:
+- Updated `apps/velocity-mvp/package.json`, `apps/velocity-mvp/package-lock.json`, `apps/velocity-mvp/tsconfig.json`, and `apps/velocity-mvp/src/worker/env.d.ts`.
+- Updated `apps/velocity-mvp/src/worker/data/db.integration.test.ts` for stable migration application in local D1 tests.
+Follow-up actions:
+- Keep `wrangler types` generation in normal dev workflow after `wrangler.toml` changes.
+
 ### DEC-005
 
 Decision ID: DEC-005  

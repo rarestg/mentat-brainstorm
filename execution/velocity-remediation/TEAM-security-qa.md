@@ -1,7 +1,7 @@
 # Team: Security / QA
 
 Owner: Carson  
-Status: IN_PROGRESS
+Status: DONE
 
 ## Scope
 
@@ -48,8 +48,8 @@ Guidance:
   - refresh-run interactions
 
 Acceptance Criteria:
-- [ ] integration suite added and passing
-- [ ] catches regressions for VEL-001 and VEL-002 classes
+- [x] integration suite added and passing
+- [x] catches regressions for VEL-001 and VEL-002 classes
 
 ### VEL-019 (Low) Limited end-to-end attribution/window edge coverage
 
@@ -70,10 +70,10 @@ Acceptance Criteria:
 ## Checklist
 
 - [x] VEL-017 fixed
-- [ ] VEL-018 fixed
+- [x] VEL-018 fixed
 - [x] VEL-019 fixed
 - [x] test reports attached
-- [ ] sign-off posted in `COMMS.md`
+- [x] sign-off posted in `COMMS.md`
 
 ## Dependencies / Requests To Other Teams
 
@@ -104,6 +104,18 @@ Validation:
 - Local D1 integration suite requires loopback listener access; elevated run request was interrupted/rejected and is pending re-run.  
 Open questions:  
 - Backend/Data confirmation requested in `COMMS.md` for canonical fixture expectations covering VEL-001/002 edge outcomes.
+
+Date: 2026-03-02  
+Engineer: Program follow-up  
+Tasks touched: VEL-018 sign-off  
+What changed:
+- Re-ran the previously blocked integration suite with full-access runtime and fixed D1 migration harness in `db.integration.test.ts`.
+- Updated integration expectations to reflect fixed rank normalization semantics (`rank >= 1`) and converted previous expected-fail guards to standard passing regressions.
+Validation:
+- `npx vitest run src/worker/data/db.integration.test.ts src/shared/scanService.test.ts src/worker/index.test.ts --reporter verbose` -> PASS (37 tests).
+- Full app pipeline run: `npm run typecheck && npm run lint && npm run test && npm run build && npm run cf:config:check` -> PASS (lint warnings only in generated `env.d.ts`).
+Open questions:
+- None blocking this lane.
 
 ## Notes To Future Contributors
 
