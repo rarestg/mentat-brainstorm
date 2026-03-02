@@ -2,6 +2,8 @@ import type {
   AttributionTransparency,
   LeaderboardArtifact,
   LeaderboardEntry,
+  LeaderboardEntryProvenance,
+  MetricBlockProvenance,
   ProfileCrown,
   ProfileMetricsHistoryPoint,
   ProfileResponse,
@@ -36,6 +38,419 @@ function round2(value: number): number {
 
 function toBoolFromNumber(value: unknown): boolean {
   return toNumber(value, 0) > 0;
+}
+
+const HEATMAP_DAYS = 7;
+const HEATMAP_HOURS = 24;
+const PROFILE_TREND_POINTS_LIMIT = 10;
+const PROFILE_ROTATING_INSIGHTS_LIMIT = 4;
+const THROUGHPUT_HEATMAP_SOURCE = 'd1:scans.windows_json.current30d.throughputHeatmap';
+const TREND_POINTS_SOURCE = 'd1:profile_metrics_history';
+const ROTATING_INSIGHTS_SOURCE = 'derived:d1:leaderboard_rows+d1:profile_metrics_history';
+
+function createEmptyHeatmapCounts(): number[][] {
+  return Array.from({ length: HEATMAP_DAYS }, () => Array.from({ length: HEATMAP_HOURS }, () => 0));
+}
+
+function isIsoTimestamp(input: string): boolean {
+  return Number.isFinite(Date.parse(input));
+}
+
+function latestIsoTimestamp(left: string | undefined, right: string | undefined): string | undefined {
+  if (!left) {
+    return right;
+  }
+  if (!right) {
+    return left;
+  }
+  if (!isIsoTimestamp(left)) {
+    return right;
+  }
+  if (!isIsoTimestamp(right)) {
+    return left;
+  }
+  return left >= right ? left : right;
+}
+
+function isValidHeatmapMatrix(value: unknown): value is number[][] {
+  return (
+    Array.isArray(value) &&
+    value.length === HEATMAP_DAYS &&
+    value.every(
+      (row) =>
+        Array.isArray(row) &&
+        row.length === HEATMAP_HOURS &&
+        row.every((cell) => typeof cell === 'number' && Number.isFinite(cell) && cell >= 0),
+    )
+  );
+}
+
+function normalizeHeatmapCounts(matrix: number[][]): number[][] {
+  return matrix.map((row) => row.map((value) => Math.max(0, Math.round(value))));
+}
+
+function addHeatmapCounts(target: number[][], source: number[][]): void {
+  for (let day = 0; day < HEATMAP_DAYS; day += 1) {
+    for (let hour = 0; hour < HEATMAP_HOURS; hour += 1) {
+      target[day][hour] += source[day][hour];
+    }
+  }
+}
+
+function toHeatmapIntensityLevels(counts: number[][]): number[][] {
+  let maxCount = 0;
+  for (const row of counts) {
+    for (const cell of row) {
+      if (cell > maxCount) {
+        maxCount = cell;
+      }
+    }
+  }
+
+  if (maxCount <= 0) {
+    return createEmptyHeatmapCounts();
+  }
+
+  return counts.map((row) =>
+    row.map((cell) => {
+      if (cell <= 0) {
+        return 0;
+      }
+      const scaled = Math.round((cell / maxCount) * 4);
+      return Math.max(1, Math.min(4, scaled));
+    }),
+  );
+}
+
+function buildInClausePlaceholders(values: unknown[]): string {
+  return values.map(() => '?').join(', ');
+}
+
+function buildTrendPointsFromHistory(
+  pointsDescendingByCaptureTime: Array<{ equivalentEngineeringHours: number }>,
+): number[] {
+  if (pointsDescendingByCaptureTime.length < 2) {
+    return [];
+  }
+
+  return [...pointsDescendingByCaptureTime]
+    .reverse()
+    .slice(-PROFILE_TREND_POINTS_LIMIT)
+    .map((point) => round2(Math.max(0, toNumber(point.equivalentEngineeringHours))));
+}
+
+function formatRatioPercent(value: number): string {
+  return `${round2(value * 100)}%`;
+}
+
+function formatSignedPercent(value: number): string {
+  const rounded = round2(value * 100);
+  return `${rounded >= 0 ? '+' : ''}${rounded}%`;
+}
+
+function buildRotatingInsights(
+  entry: {
+    rank: number;
+    totals: {
+      equivalentEngineeringHours: number;
+      mergedPrsUnverified: number;
+      mergedPrsCiVerified: number;
+      mergedPrs: number;
+      offHoursRatio: number;
+      velocityAcceleration: number;
+    };
+  },
+  percentile: number | undefined,
+  trendPoints: number[],
+): string[] {
+  const insights: string[] = [];
+  insights.push(
+    `Rank #${entry.rank} with ${round2(entry.totals.equivalentEngineeringHours)} equivalent engineering hours in the current 30-day window.`,
+  );
+
+  if (entry.totals.mergedPrsUnverified > 0) {
+    const coverageRatio = entry.totals.mergedPrsCiVerified / entry.totals.mergedPrsUnverified;
+    insights.push(
+      `CI verification coverage is ${formatRatioPercent(coverageRatio)} (${entry.totals.mergedPrsCiVerified}/${entry.totals.mergedPrsUnverified} merged PRs).`,
+    );
+  } else if (entry.totals.mergedPrsCiVerified > 0) {
+    insights.push(`CI-verified merged PRs recorded: ${entry.totals.mergedPrsCiVerified}.`);
+  } else {
+    insights.push('No merged PRs were observed in this 30-day window.');
+  }
+
+  insights.push(
+    `Velocity acceleration is ${formatSignedPercent(entry.totals.velocityAcceleration)} and off-hours ratio is ${formatRatioPercent(entry.totals.offHoursRatio)}.`,
+  );
+
+  if (trendPoints.length >= 2) {
+    const delta = round2(trendPoints[trendPoints.length - 1] - trendPoints[0]);
+    const direction = delta > 0 ? 'up' : delta < 0 ? 'down' : 'flat';
+    insights.push(`Trend moved ${direction} by ${Math.abs(delta)} EEH across the latest ${trendPoints.length} snapshots.`);
+  } else {
+    insights.push(`Trend requires at least 2 snapshots; currently ${trendPoints.length} point is available.`);
+  }
+
+  if (typeof percentile === 'number' && Number.isFinite(percentile)) {
+    insights.push(`Current global percentile is ${round2(percentile)}.`);
+  }
+
+  return insights.slice(0, PROFILE_ROTATING_INSIGHTS_LIMIT);
+}
+
+function authoritativeProvenance(source: string, capturedAt?: string): MetricBlockProvenance {
+  return {
+    state: 'authoritative',
+    source,
+    capturedAt,
+  };
+}
+
+function unavailableProvenance(source: string, reason: string, capturedAt?: string): MetricBlockProvenance {
+  return {
+    state: 'unavailable',
+    source,
+    reason,
+    capturedAt,
+  };
+}
+
+interface TrendPayload {
+  trendPoints?: number[];
+  capturedAt?: string;
+  reason?: string;
+}
+
+interface HeatmapPayload {
+  throughputHeatmap?: number[][];
+  capturedAt?: string;
+  reason?: string;
+}
+
+interface HistoryTrendSqlRow {
+  user_id: number;
+  captured_at: string;
+  equivalent_engineering_hours: number;
+}
+
+interface LatestScanHeatmapSqlRow {
+  user_id: number;
+  scanned_at: string;
+  windows_json: string;
+}
+
+function parseCurrentWindowHeatmapFromWindowsJson(windowsJson: string): {
+  foundCurrentWindow: boolean;
+  heatmapCounts?: number[][];
+} {
+  try {
+    const parsed = JSON.parse(windowsJson) as unknown;
+    if (!Array.isArray(parsed)) {
+      return { foundCurrentWindow: false };
+    }
+
+    const currentWindow = parsed.find((windowSummary) => {
+      if (!windowSummary || typeof windowSummary !== 'object') {
+        return false;
+      }
+      return toStringValue((windowSummary as { label?: unknown }).label) === 'current30d';
+    }) as { throughputHeatmap?: unknown } | undefined;
+
+    if (!currentWindow) {
+      return { foundCurrentWindow: false };
+    }
+
+    if (!isValidHeatmapMatrix(currentWindow.throughputHeatmap)) {
+      return { foundCurrentWindow: true };
+    }
+
+    return {
+      foundCurrentWindow: true,
+      heatmapCounts: normalizeHeatmapCounts(currentWindow.throughputHeatmap),
+    };
+  } catch {
+    return { foundCurrentWindow: false };
+  }
+}
+
+async function loadTrendPayloadByUserId(db: D1Database, userIds: number[]): Promise<Map<number, TrendPayload>> {
+  const payloadByUserId = new Map<number, TrendPayload>();
+  if (userIds.length === 0) {
+    return payloadByUserId;
+  }
+
+  const placeholders = buildInClausePlaceholders(userIds);
+  const trendRowsResult = await db
+    .prepare(
+      `WITH ranked_history AS (
+         SELECT
+           user_id,
+           captured_at,
+           equivalent_engineering_hours,
+           ROW_NUMBER() OVER (
+             PARTITION BY user_id
+             ORDER BY datetime(captured_at) DESC, id DESC
+           ) AS history_rank
+         FROM profile_metrics_history
+         WHERE user_id IN (${placeholders})
+       )
+       SELECT user_id, captured_at, equivalent_engineering_hours
+       FROM ranked_history
+       WHERE history_rank <= ${PROFILE_TREND_POINTS_LIMIT}
+       ORDER BY user_id ASC, datetime(captured_at) DESC, captured_at DESC`,
+    )
+    .bind(...userIds)
+    .all<HistoryTrendSqlRow>();
+
+  const historyByUserId = new Map<number, Array<{ capturedAt: string; equivalentEngineeringHours: number }>>();
+  for (const row of trendRowsResult.results ?? []) {
+    const existing = historyByUserId.get(row.user_id) ?? [];
+    existing.push({
+      capturedAt: row.captured_at,
+      equivalentEngineeringHours: round2(toNumber(row.equivalent_engineering_hours)),
+    });
+    historyByUserId.set(row.user_id, existing);
+  }
+
+  for (const userId of userIds) {
+    const history = historyByUserId.get(userId) ?? [];
+    const trendPoints = buildTrendPointsFromHistory(history);
+    const latestCapturedAt = history[0]?.capturedAt;
+
+    if (trendPoints.length >= 2) {
+      payloadByUserId.set(userId, {
+        trendPoints,
+        capturedAt: latestCapturedAt,
+      });
+      continue;
+    }
+
+    payloadByUserId.set(userId, {
+      capturedAt: latestCapturedAt,
+      reason: history.length === 0 ? 'no-profile-history' : 'insufficient-history-points',
+    });
+  }
+
+  return payloadByUserId;
+}
+
+async function loadHeatmapPayloadByUserId(db: D1Database, userIds: number[]): Promise<Map<number, HeatmapPayload>> {
+  const payloadByUserId = new Map<number, HeatmapPayload>();
+  if (userIds.length === 0) {
+    return payloadByUserId;
+  }
+
+  const placeholders = buildInClausePlaceholders(userIds);
+  const rowsResult = await db
+    .prepare(
+      `WITH latest_repo_scans AS (
+         SELECT
+           s.user_id,
+           s.id AS snapshot_id,
+           s.scanned_at,
+           ROW_NUMBER() OVER (
+             PARTITION BY s.user_id, s.repo_id
+             ORDER BY datetime(s.scanned_at) DESC, s.id DESC
+           ) AS repo_rank
+         FROM snapshots s
+         WHERE s.snapshot_type = 'scan'
+           AND s.repo_id IS NOT NULL
+           AND s.user_id IN (${placeholders})
+       )
+       SELECT
+         lrs.user_id,
+         lrs.scanned_at,
+         sc.windows_json
+       FROM latest_repo_scans lrs
+       INNER JOIN scans sc ON sc.snapshot_id = lrs.snapshot_id
+       WHERE lrs.repo_rank = 1`,
+    )
+    .bind(...userIds)
+    .all<LatestScanHeatmapSqlRow>();
+
+  const aggregateByUserId = new Map<
+    number,
+    {
+      hasLatestRepoScan: boolean;
+      hasCurrentWindow: boolean;
+      hasHeatmapCounts: boolean;
+      latestScannedAt?: string;
+      counts: number[][];
+    }
+  >();
+
+  for (const row of rowsResult.results ?? []) {
+    const current = aggregateByUserId.get(row.user_id) ?? {
+      hasLatestRepoScan: false,
+      hasCurrentWindow: false,
+      hasHeatmapCounts: false,
+      latestScannedAt: undefined,
+      counts: createEmptyHeatmapCounts(),
+    };
+    current.hasLatestRepoScan = true;
+    current.latestScannedAt = latestIsoTimestamp(current.latestScannedAt, row.scanned_at);
+
+    const parsed = parseCurrentWindowHeatmapFromWindowsJson(row.windows_json);
+    if (parsed.foundCurrentWindow) {
+      current.hasCurrentWindow = true;
+    }
+    if (parsed.heatmapCounts) {
+      current.hasHeatmapCounts = true;
+      addHeatmapCounts(current.counts, parsed.heatmapCounts);
+    }
+
+    aggregateByUserId.set(row.user_id, current);
+  }
+
+  for (const userId of userIds) {
+    const aggregate = aggregateByUserId.get(userId);
+    if (!aggregate) {
+      payloadByUserId.set(userId, { reason: 'no-scan-history' });
+      continue;
+    }
+
+    if (aggregate.hasHeatmapCounts) {
+      payloadByUserId.set(userId, {
+        throughputHeatmap: toHeatmapIntensityLevels(aggregate.counts),
+        capturedAt: aggregate.latestScannedAt,
+      });
+      continue;
+    }
+
+    payloadByUserId.set(userId, {
+      capturedAt: aggregate.latestScannedAt,
+      reason: aggregate.hasCurrentWindow ? 'missing-throughput-heatmap-buckets' : 'missing-current30d-window',
+    });
+  }
+
+  return payloadByUserId;
+}
+
+function buildProfileProvenance(params: {
+  totalsCapturedAt?: string;
+  trendPayload: TrendPayload;
+  heatmapPayload: HeatmapPayload;
+  hasRotatingInsights: boolean;
+}): LeaderboardEntryProvenance {
+  return {
+    totals: authoritativeProvenance('d1:leaderboard_rows', params.totalsCapturedAt),
+    thirtyDay: authoritativeProvenance('d1:snapshots.current30d.aggregate', params.totalsCapturedAt),
+    profile: {
+      trendPoints: params.trendPayload.trendPoints
+        ? authoritativeProvenance(TREND_POINTS_SOURCE, params.trendPayload.capturedAt)
+        : unavailableProvenance(TREND_POINTS_SOURCE, params.trendPayload.reason ?? 'insufficient-history-points', params.trendPayload.capturedAt),
+      throughputHeatmap: params.heatmapPayload.throughputHeatmap
+        ? authoritativeProvenance(THROUGHPUT_HEATMAP_SOURCE, params.heatmapPayload.capturedAt)
+        : unavailableProvenance(
+            THROUGHPUT_HEATMAP_SOURCE,
+            params.heatmapPayload.reason ?? 'missing-throughput-heatmap-buckets',
+            params.heatmapPayload.capturedAt,
+          ),
+      rotatingInsights: params.hasRotatingInsights
+        ? authoritativeProvenance(ROTATING_INSIGHTS_SOURCE, params.totalsCapturedAt)
+        : unavailableProvenance(ROTATING_INSIGHTS_SOURCE, 'insights-derivation-failed', params.totalsCapturedAt),
+    },
+  };
 }
 
 function normalizeAttribution(input: AttributionTransparency | undefined): AttributionTransparency {
@@ -916,6 +1331,7 @@ interface LeaderboardSqlRow {
   user_id: number;
   handle: string;
   rank: number;
+  leaderboard_updated_at: string;
   scanned_repos: number;
   featured_repo: string | null;
   ai_ready_score: number | null;
@@ -969,6 +1385,7 @@ export async function getLeaderboardArtifact(db: D1Database): Promise<Leaderboar
         lr.user_id,
         u.handle,
         lr.rank,
+        lr.updated_at AS leaderboard_updated_at,
         lr.scanned_repos,
         lr.featured_repo,
         lr.ai_ready_score,
@@ -1008,7 +1425,12 @@ export async function getLeaderboardArtifact(db: D1Database): Promise<Leaderboar
     .all<LeaderboardSqlRow>();
 
   const rows = rowsResult.results ?? [];
-  const crownsByHandle = await loadCrownsByHandle(db);
+  const userIds = rows.map((row) => toNumber(row.user_id)).filter((userId) => userId > 0);
+  const [crownsByHandle, trendPayloadByUserId, heatmapPayloadByUserId] = await Promise.all([
+    loadCrownsByHandle(db),
+    loadTrendPayloadByUserId(db, userIds),
+    loadHeatmapPayloadByUserId(db, userIds),
+  ]);
 
   const entries: LeaderboardEntry[] = rows.map((row, index) => {
     const fallbackRank = index + 1;
@@ -1016,6 +1438,28 @@ export async function getLeaderboardArtifact(db: D1Database): Promise<Leaderboar
     const totalEeh = toNumber(row.total_equivalent_engineering_hours);
     const handle = toStringValue(row.handle);
     const normalizedHandle = handle.toLowerCase();
+    const percentile = computePercentile(rank, rows.length);
+    const totalsCapturedAt = isIsoTimestamp(row.leaderboard_updated_at) ? row.leaderboard_updated_at : undefined;
+    const trendPayload = trendPayloadByUserId.get(row.user_id) ?? { reason: 'no-profile-history' };
+    const heatmapPayload = heatmapPayloadByUserId.get(row.user_id) ?? { reason: 'no-scan-history' };
+
+    const totals = {
+      equivalentEngineeringHours: round2(totalEeh),
+      mergedPrsUnverified: Math.round(toNumber(row.total_merged_prs_unverified)),
+      mergedPrsCiVerified: Math.round(toNumber(row.total_merged_prs_ci_verified)),
+      mergedPrs: Math.round(toNumber(row.total_merged_prs)),
+      commitsPerDay: round2(toNumber(row.total_commits_per_day)),
+      activeCodingHours: round2(toNumber(row.total_active_coding_hours)),
+      offHoursRatio: round2(toNumber(row.total_off_hours_ratio)),
+      velocityAcceleration: round2(toNumber(row.total_velocity_acceleration)),
+    };
+    const rotatingInsights = buildRotatingInsights({ rank, totals }, percentile, trendPayload.trendPoints ?? []);
+    const provenance = buildProfileProvenance({
+      totalsCapturedAt,
+      trendPayload,
+      heatmapPayload,
+      hasRotatingInsights: rotatingInsights.length > 0,
+    });
 
     return {
       rank,
@@ -1024,13 +1468,14 @@ export async function getLeaderboardArtifact(db: D1Database): Promise<Leaderboar
       featuredRepo: row.featured_repo ?? undefined,
       aiReadyScore: row.ai_ready_score === null ? undefined : toNumber(row.ai_ready_score),
       scanInsight: row.scan_insight ?? undefined,
-      percentile: computePercentile(rank, rows.length),
+      percentile,
       stackTier: inferOperatingStackTier({
         commitsPerDay: toNumber(row.total_commits_per_day),
         offHoursRatio: toNumber(row.total_off_hours_ratio),
         activeCodingHours: toNumber(row.total_active_coding_hours),
       }),
       attribution: parseAttributionFromRow(row),
+      provenance,
       crowns: crownsByHandle.get(normalizedHandle) ?? [],
       thirtyDay: {
         equivalentEngineeringHours: round2(toNumber(row.t30_equivalent_engineering_hours)),
@@ -1038,16 +1483,13 @@ export async function getLeaderboardArtifact(db: D1Database): Promise<Leaderboar
         commitsPerDay: round2(toNumber(row.t30_commits_per_day)),
         activeCodingHours: round2(toNumber(row.t30_active_coding_hours)),
       },
-      totals: {
-        equivalentEngineeringHours: round2(totalEeh),
-        mergedPrsUnverified: Math.round(toNumber(row.total_merged_prs_unverified)),
-        mergedPrsCiVerified: Math.round(toNumber(row.total_merged_prs_ci_verified)),
-        mergedPrs: Math.round(toNumber(row.total_merged_prs)),
-        commitsPerDay: round2(toNumber(row.total_commits_per_day)),
-        activeCodingHours: round2(toNumber(row.total_active_coding_hours)),
-        offHoursRatio: round2(toNumber(row.total_off_hours_ratio)),
-        velocityAcceleration: round2(toNumber(row.total_velocity_acceleration)),
+      profile: {
+        globalRank: rank,
+        trendPoints: trendPayload.trendPoints,
+        throughputHeatmap: heatmapPayload.throughputHeatmap,
+        rotatingInsights,
       },
+      totals,
       repos: [],
     };
   });
@@ -1071,6 +1513,7 @@ export async function getProfileByHandle(db: D1Database, handle: string): Promis
         lr.user_id,
         u.handle,
         lr.rank,
+        lr.updated_at AS leaderboard_updated_at,
         lr.scanned_repos,
         lr.featured_repo,
         lr.ai_ready_score,
@@ -1141,6 +1584,9 @@ export async function getProfileByHandle(db: D1Database, handle: string): Promis
       active_coding_hours: number;
     }>();
 
+  const heatmapPayloadByUserId = await loadHeatmapPayloadByUserId(db, [row.user_id]);
+  const heatmapPayload = heatmapPayloadByUserId.get(row.user_id) ?? { reason: 'no-scan-history' };
+
   const totalRows = Math.max(1, toNumber(row.total_rows, 1));
   const rank = Math.min(Math.max(1, Math.round(toNumber(row.rank, 1))), totalRows);
   const totalEeh = toNumber(row.total_equivalent_engineering_hours);
@@ -1172,6 +1618,37 @@ export async function getProfileByHandle(db: D1Database, handle: string): Promis
     activeCodingHours: round2(toNumber(historyRow.active_coding_hours)),
   }));
 
+  const trendPoints = buildTrendPointsFromHistory(history);
+  const trendPayload: TrendPayload =
+    trendPoints.length >= 2
+      ? {
+          trendPoints,
+          capturedAt: history[0]?.capturedAt,
+        }
+      : {
+          capturedAt: history[0]?.capturedAt,
+          reason: history.length === 0 ? 'no-profile-history' : 'insufficient-history-points',
+        };
+
+  const totals = {
+    equivalentEngineeringHours: round2(totalEeh),
+    mergedPrsUnverified: Math.round(toNumber(row.total_merged_prs_unverified)),
+    mergedPrsCiVerified: Math.round(toNumber(row.total_merged_prs_ci_verified)),
+    mergedPrs: Math.round(toNumber(row.total_merged_prs)),
+    commitsPerDay: round2(toNumber(row.total_commits_per_day)),
+    activeCodingHours: round2(toNumber(row.total_active_coding_hours)),
+    offHoursRatio: round2(toNumber(row.total_off_hours_ratio)),
+    velocityAcceleration: round2(toNumber(row.total_velocity_acceleration)),
+  };
+  const rotatingInsights = buildRotatingInsights({ rank, totals }, percentile, trendPayload.trendPoints ?? []);
+  const totalsCapturedAt = isIsoTimestamp(row.leaderboard_updated_at) ? row.leaderboard_updated_at : undefined;
+  const provenance = buildProfileProvenance({
+    totalsCapturedAt,
+    trendPayload,
+    heatmapPayload,
+    hasRotatingInsights: rotatingInsights.length > 0,
+  });
+
   const leaderboard: LeaderboardEntry = {
     rank,
     handle: toStringValue(row.handle),
@@ -1182,6 +1659,7 @@ export async function getProfileByHandle(db: D1Database, handle: string): Promis
     percentile,
     stackTier,
     attribution: parseAttributionFromRow(row),
+    provenance,
     crowns: crowns.map((crown) => crown.key),
     thirtyDay: {
       equivalentEngineeringHours: round2(toNumber(row.t30_equivalent_engineering_hours)),
@@ -1189,16 +1667,13 @@ export async function getProfileByHandle(db: D1Database, handle: string): Promis
       commitsPerDay: round2(toNumber(row.t30_commits_per_day)),
       activeCodingHours: round2(toNumber(row.t30_active_coding_hours)),
     },
-    totals: {
-      equivalentEngineeringHours: round2(totalEeh),
-      mergedPrsUnverified: Math.round(toNumber(row.total_merged_prs_unverified)),
-      mergedPrsCiVerified: Math.round(toNumber(row.total_merged_prs_ci_verified)),
-      mergedPrs: Math.round(toNumber(row.total_merged_prs)),
-      commitsPerDay: round2(toNumber(row.total_commits_per_day)),
-      activeCodingHours: round2(toNumber(row.total_active_coding_hours)),
-      offHoursRatio: round2(toNumber(row.total_off_hours_ratio)),
-      velocityAcceleration: round2(toNumber(row.total_velocity_acceleration)),
+    profile: {
+      globalRank: rank,
+      trendPoints: trendPayload.trendPoints,
+      throughputHeatmap: heatmapPayload.throughputHeatmap,
+      rotatingInsights,
     },
+    totals,
     repos: [],
   };
 

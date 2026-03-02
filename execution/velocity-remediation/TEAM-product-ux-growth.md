@@ -1,7 +1,7 @@
 # Team: Product / UX / Growth
 
 Owner: Hegel  
-Status: IN_PROGRESS
+Status: DONE
 
 ## Scope
 
@@ -115,7 +115,7 @@ Acceptance Criteria:
 - [x] VEL-008 fixed
 - [x] VEL-009 fixed
 - [x] VEL-010 fixed
-- [ ] desktop + mobile UX QA complete
+- [x] desktop + mobile UX QA complete
 
 ## Dependencies / Requests To Other Teams
 
@@ -123,6 +123,13 @@ Acceptance Criteria:
 - Security/QA for instrumentation and regression checks.
 
 ## Work Log
+
+Date: 2026-03-02  
+Engineer: Product/UX QA closeout  
+Tasks touched: VEL-006, VEL-007, VEL-008, VEL-009, VEL-010  
+What changed: Completed desktop + mobile QA pass across post-scan conversion lane, share/challenge/invite visibility, trust/provenance treatment, return-loop modules, and loading/comparison clarity. Implemented a targeted client fix in `apps/velocity-mvp/src/client/App.tsx` so mobile leaderboard cards now show explicit loading and empty states (previously blank while artifact was loading or absent).  
+Validation: `npm run lint -- src/client/App.tsx src/client/styles.css` (pass with non-blocking existing warnings in `src/worker/env.d.ts` and CSS-file ignore notice), `npm run typecheck` (pass), `npm run build` (pass).  
+Open questions: None. Backend payload enrichments were delivered on 2026-03-02; modules remain explicitly unavailable only where per-profile authoritative history data is not yet present.  
 
 Date: 2026-02-28  
 Engineer: Hegel  

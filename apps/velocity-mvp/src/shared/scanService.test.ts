@@ -204,6 +204,8 @@ describe('scanService attribution/window edges', () => {
     expect(report.metrics.mergedPrsUnverified).toBe(70);
     expect(report.metrics.equivalentEngineeringHours).toBeGreaterThan(0);
     expect(report.windows).toHaveLength(2);
+    expect(report.windows[0]?.throughputHeatmap).toHaveLength(7);
+    expect(report.windows[0]?.throughputHeatmap?.[0]).toHaveLength(24);
     expect(report.assumptions.defaultBranchScope).toContain('main/master');
   });
 });

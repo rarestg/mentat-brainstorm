@@ -28,6 +28,33 @@ Follow-up actions:
 
 ## Decisions
 
+### DEC-007
+
+Decision ID: DEC-007  
+Date: 2026-03-02  
+Owner: Backend/Data  
+Related Tasks: VEL-008, VEL-006  
+Context: Product/UX requested backend-complete profile modules (`trendPoints`, `throughputHeatmap`, `rotatingInsights`) plus explicit provenance so UI can separate trusted live signal from unavailable states. Existing stored payloads did not include explicit module provenance, and older scan windows did not include commit-hour heatmap buckets.  
+Decision:  
+- Add explicit block-level provenance metadata to leaderboard/profile entries for trust-critical metric blocks (`totals`, `thirtyDay`, profile module blocks).  
+- Generate `profile.trendPoints` only from persisted `profile_metrics_history` (requires >=2 points to be authoritative).  
+- Generate `profile.throughputHeatmap` only from persisted commit-hour scan buckets (`windows[].throughputHeatmap`) aggregated from latest scan per repo.  
+- Keep unavailable states explicit when backing data is missing; do not synthesize authoritative fallback values.  
+- Generate `profile.rotatingInsights` as deterministic text derived from persisted authoritative metrics/history.  
+Alternatives considered:
+- Synthesize heatmap/trend defaults from coarse totals (`offHoursRatio`, `activeCodingHours`) and label with disclaimers.
+- Hide profile modules entirely until future schema migration/backfill.
+Tradeoffs:
+- Trust posture improves because authoritative flags now match real persisted sources.
+- Coverage for throughput heatmap depends on refreshed scans carrying commit-hour buckets; legacy scans remain explicitly unavailable until refreshed.
+- Payload complexity increases due to per-block provenance, but UI trust handling becomes deterministic.
+Implementation notes:
+- Updated `apps/velocity-mvp/src/shared/types.ts`, `apps/velocity-mvp/src/shared/metrics.ts`, `apps/velocity-mvp/src/worker/data/db.ts`.
+- Added/updated tests in `apps/velocity-mvp/src/shared/metrics.test.ts`, `apps/velocity-mvp/src/shared/scanService.test.ts`, `apps/velocity-mvp/src/worker/data/db.test.ts`.
+- Closed Product->Backend provenance request in `execution/velocity-remediation/COMMS.md`.
+Follow-up actions:
+- Ensure scheduled/manual refresh runs repopulate legacy scan windows so heatmap availability converges to authoritative coverage.
+
 ### DEC-006
 
 Decision ID: DEC-006  

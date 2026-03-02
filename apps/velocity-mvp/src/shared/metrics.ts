@@ -11,20 +11,26 @@ interface WindowInput {
 }
 
 const HOURS_PER_DAY_CAP = 12;
+const HEATMAP_DAYS = 7;
+const HEATMAP_HOURS = 24;
 
-function toHourBucket(dateIso: string): string {
-  const d = new Date(dateIso);
+function toHourBucket(date: Date): string {
+  const d = new Date(date);
   d.setUTCMinutes(0, 0, 0);
   return d.toISOString();
 }
 
-function toDayBucket(dateIso: string): string {
-  return dateIso.slice(0, 10);
+function toDayBucket(date: Date): string {
+  return date.toISOString().slice(0, 10);
 }
 
 function round(value: number, decimals = 2): number {
   const base = 10 ** decimals;
   return Math.round(value * base) / base;
+}
+
+function createEmptyHeatmapCounts(): number[][] {
+  return Array.from({ length: HEATMAP_DAYS }, () => Array.from({ length: HEATMAP_HOURS }, () => 0));
 }
 
 export function computeWindowSummary(input: WindowInput): ScanWindowSummary {
@@ -33,14 +39,23 @@ export function computeWindowSummary(input: WindowInput): ScanWindowSummary {
   const dailyCommitCounts = new Map<string, number>();
   const dailyHours = new Map<string, Set<string>>();
   const dailyMergedPrs = new Map<string, number>();
+  const throughputHeatmap = createEmptyHeatmapCounts();
 
   for (const commit of input.commits) {
-    const dateIso = commit.commit.author.date;
-    const hourBucket = toHourBucket(dateIso);
-    const dayBucket = toDayBucket(dateIso);
+    const commitDate = new Date(commit.commit.author.date);
+    if (!Number.isFinite(commitDate.getTime())) {
+      continue;
+    }
+
+    const hourBucket = toHourBucket(commitDate);
+    const dayBucket = toDayBucket(commitDate);
     hourBuckets.add(hourBucket);
 
-    const hourOfDay = new Date(hourBucket).getUTCHours();
+    const dayOfWeek = commitDate.getUTCDay();
+    const hourOfDay = commitDate.getUTCHours();
+    const existing = throughputHeatmap[dayOfWeek]?.[hourOfDay] ?? 0;
+    throughputHeatmap[dayOfWeek][hourOfDay] = existing + 1;
+
     if (hourOfDay < 9 || hourOfDay >= 18) {
       offHourBuckets.add(hourBucket);
     }
@@ -58,7 +73,11 @@ export function computeWindowSummary(input: WindowInput): ScanWindowSummary {
     if (!pr.merged_at) {
       continue;
     }
-    const dayBucket = toDayBucket(pr.merged_at);
+    const mergedAt = new Date(pr.merged_at);
+    if (!Number.isFinite(mergedAt.getTime())) {
+      continue;
+    }
+    const dayBucket = toDayBucket(mergedAt);
     dailyMergedPrs.set(dayBucket, (dailyMergedPrs.get(dayBucket) ?? 0) + 1);
   }
 
@@ -87,6 +106,7 @@ export function computeWindowSummary(input: WindowInput): ScanWindowSummary {
     activeCodingHours: hourBuckets.size,
     offHoursRatio: hourBuckets.size === 0 ? 0 : round(offHourBuckets.size / hourBuckets.size),
     equivalentEngineeringHours: round(equivalentEngineeringHours),
+    throughputHeatmap,
   };
 }
 

@@ -124,6 +124,21 @@ Acceptance Criteria:
 
 ## Work Log
 
+Date: 2026-03-02  
+Engineer: Pasteur  
+Tasks touched: VEL-008, VEL-006  
+What changed:
+- Implemented backend payload assembly for `profile.trendPoints`, `profile.throughputHeatmap`, and `profile.rotatingInsights` in both `/api/leaderboard` and `/api/profile/:handle`.
+- Added explicit per-block provenance metadata (`authoritative` vs `unavailable`) for trust-critical leaderboard/profile metric blocks (`totals`, `thirtyDay`, and profile modules).
+- Extended scan metric computation to persist authoritative commit-hour throughput buckets (`windows[].throughputHeatmap`), then aggregated latest per-repo scan windows into profile heatmap payloads.
+- Kept trust semantics strict: profile modules are only marked authoritative when backed by persisted data; otherwise response includes explicit unavailable reason (no synthetic authoritative fallback).
+- Added regression coverage in `src/shared/metrics.test.ts`, `src/shared/scanService.test.ts`, and `src/worker/data/db.test.ts` for payload shape and provenance semantics.
+Validation:
+- Focused tests: `npm test -- src/shared/metrics.test.ts src/shared/scanService.test.ts src/worker/data/db.test.ts src/worker/index.test.ts` (pass).
+- Quality gates: `npm run typecheck && npm run lint && npm run build` (pass; lint reports existing warnings in generated `src/worker/env.d.ts`).
+Open questions:
+- None for this lane; Product/UX can now consume module-level provenance to decide when to render live data vs unavailable copy.
+
 Date: 2026-02-28  
 Engineer: Pasteur  
 Tasks touched: VEL-001, VEL-002, VEL-003, VEL-004, VEL-005  

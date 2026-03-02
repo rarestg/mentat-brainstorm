@@ -11,6 +11,7 @@ export interface ScanWindowSummary {
   activeCodingHours: number;
   offHoursRatio: number;
   equivalentEngineeringHours: number;
+  throughputHeatmap?: number[][];
 }
 
 export interface VelocityMetrics {
@@ -113,6 +114,23 @@ export interface LeaderboardThirtyDayMetrics {
   activeCodingHours: number;
 }
 
+export interface MetricBlockProvenance {
+  state: 'authoritative' | 'unavailable';
+  source: string;
+  capturedAt?: string;
+  reason?: string;
+}
+
+export interface LeaderboardEntryProvenance {
+  totals: MetricBlockProvenance;
+  thirtyDay: MetricBlockProvenance;
+  profile: {
+    trendPoints: MetricBlockProvenance;
+    throughputHeatmap: MetricBlockProvenance;
+    rotatingInsights: MetricBlockProvenance;
+  };
+}
+
 export interface LeaderboardEntry {
   rank: number;
   handle: string;
@@ -124,6 +142,7 @@ export interface LeaderboardEntry {
   stackTier?: OperatingStackTier;
   crowns?: string[];
   attribution?: AttributionTransparency;
+  provenance?: LeaderboardEntryProvenance;
   thirtyDay?: LeaderboardThirtyDayMetrics;
   profile?: {
     tier?: string;

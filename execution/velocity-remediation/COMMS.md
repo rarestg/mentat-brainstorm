@@ -32,6 +32,23 @@ Resolution notes:
 ### 2026-03-02
 
 Date: 2026-03-02  
+From Team: Product/UX/Growth  
+To Team: Backend/Data  
+Task IDs: VEL-008, VEL-010  
+Subject: QA follow-up: profile payload contract needed for live trend/heatmap/insight modules  
+Message: Desktop/mobile QA closeout confirms fallback UX is correct (explicit unavailable states + provenance), but profile modules remain unavailable without backend fields. This does not block remediation closure, but it blocks activation of live trust modules.  
+Action requested: Provide field-level contract + ETA for `profile.trendPoints` (>=2 chronological points), `profile.throughputHeatmap` (matrix bins), `profile.rotatingInsights` (non-empty string array), and explicit provenance metadata in `/api/leaderboard` and `/api/profile` payloads so Product can remove unavailable states without additional copy changes.  
+Due: 2026-03-04  
+Status: RESOLVED  
+Resolution notes:
+- Delivered in backend payload assembly updates on 2026-03-02:
+  - `entry.profile.trendPoints` (authoritative when >=2 history points).
+  - `entry.profile.throughputHeatmap` (authoritative when scan windows include commit-hour buckets).
+  - `entry.profile.rotatingInsights` (deterministic non-empty array from persisted metrics/history).
+  - `entry.provenance` block for trust-critical metrics/modules in both `/api/leaderboard` and `/api/profile/:handle`.
+- Unavailable states are explicit and machine-readable via provenance (`state: unavailable`, `reason`), so Product/UX can keep copy stable while enabling live modules as data becomes available.
+
+Date: 2026-03-02  
 From Team: Program Lead  
 To Team: Cloudflare/Platform, Security/QA, Backend/Data  
 Task IDs: VEL-011, VEL-018, VEL-014, VEL-015, VEL-016  
@@ -109,8 +126,18 @@ Subject: Backend provenance payloads needed to replace unavailable profile modul
 Message: We removed synthetic trend/heatmap/insight rendering and now show explicit unavailable states with provenance labels. To fully unlock these modules, provide authoritative `profile.trendPoints`, `profile.throughputHeatmap`, `profile.rotatingInsights`, and explicit provenance metadata in leaderboard/profile payloads.  
 Action requested: Confirm payload shape + ETA for these fields so UX can flip modules from unavailable to live signal without copy changes.  
 Due: 2026-03-03  
-Status: OPEN  
+Status: RESOLVED  
 Resolution notes:
+- Backend payload shape is now live in both `/api/leaderboard` and `/api/profile/:handle`:
+  - `entry.profile.trendPoints`
+  - `entry.profile.throughputHeatmap`
+  - `entry.profile.rotatingInsights`
+  - `entry.provenance` with trust-critical blocks (`totals`, `thirtyDay`, and profile module provenance).
+- Provenance semantics:
+  - `state: authoritative` only when block is backed by persisted DB data.
+  - `state: unavailable` includes explicit `reason` (`no-profile-history`, `insufficient-history-points`, `no-scan-history`, `missing-current30d-window`, `missing-throughput-heatmap-buckets`).
+- Throughput heatmap source is authoritative commit-hour scan buckets (`windows[].throughputHeatmap`) aggregated from latest scan per repo; no synthetic authoritative fallback is emitted.
+- Rotating insights are deterministic text derived from authoritative stored metrics/history; trend points require >=2 history snapshots to become authoritative.
 
 Date: 2026-02-28  
 From Team: Program Lead  

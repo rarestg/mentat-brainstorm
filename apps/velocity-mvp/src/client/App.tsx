@@ -1286,6 +1286,14 @@ export function App() {
                   </p>
                   {leaderboardError ? <p className="text-sm text-state-danger">{leaderboardError}</p> : null}
                   <div className="mb-3 grid gap-3 sm:hidden">
+                    {!leaderboardError && !leaderboard ? (
+                      <p className="rounded-lg border border-slate-700 bg-surface-2 px-3 py-4 text-sm text-ink-2">Loading leaderboard artifact...</p>
+                    ) : null}
+                    {!leaderboardError && leaderboard && leaderboard.entries.length === 0 ? (
+                      <p className="rounded-lg border border-slate-700 bg-surface-2 px-3 py-4 text-sm text-ink-2">
+                        No leaderboard entries available yet. Run bootstrap to generate data.
+                      </p>
+                    ) : null}
                     {sortedEntries.map((entry) => {
                       const percentile = getPercentile(entry, sortedEntries.length);
                       const nextHigher = sortedEntries.find((candidate) => candidate.rank === entry.rank - 1) ?? null;

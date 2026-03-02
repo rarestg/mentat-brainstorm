@@ -58,6 +58,12 @@ describe('metrics', () => {
 
     expect(current.activeCodingHours).toBe(3);
     expect(current.offHoursRatio).toBeCloseTo(0.67, 2);
+    expect(current.throughputHeatmap).toHaveLength(7);
+    expect(current.throughputHeatmap?.[0]).toHaveLength(24);
+    const heatmapTotal = (current.throughputHeatmap ?? []).flat().reduce((sum, value) => sum + value, 0);
+    expect(heatmapTotal).toBe(3);
+    expect(current.throughputHeatmap?.[new Date('2026-01-10T08:12:00.000Z').getUTCDay()]?.[8]).toBe(1);
+    expect(current.throughputHeatmap?.[new Date('2026-01-11T23:10:00.000Z').getUTCDay()]?.[23]).toBe(1);
 
     const metrics = buildMetrics(current, previous);
     expect(metrics.commitsPerDay).toBeCloseTo(0.1, 3);
