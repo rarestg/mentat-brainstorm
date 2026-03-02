@@ -7,7 +7,7 @@ type View = 'leaderboard' | 'scan';
 
 type Route =
   | { kind: 'home' }
-  | { kind: 'profile'; handle: string };
+  | { kind: 'profile'; handle: string; challengeTargetHandle: string | null; hasInvalidChallengeQuery: boolean };
 
 type TelemetryValue = string | number | boolean | null;
 
@@ -25,6 +25,7 @@ const TREND_CHART_HEIGHT = 144;
 const TREND_CHART_PADDING = 14;
 const UX_EVENT_STORAGE_KEY = 'mentat.velocity.ux.events';
 const PROFILE_VISIT_STORAGE_KEY_PREFIX = 'mentat.velocity.profile.lastVisit.';
+const HANDLE_PATTERN = /^[A-Za-z0-9_.-]+$/;
 
 function formatPercent(v: number): string {
   return `${(v * 100).toFixed(0)}%`;
@@ -152,17 +153,26 @@ function buildProfileUrl(origin: string, handle: string): string {
   return `${origin}/v/${encodeURIComponent(handle.toLowerCase())}`;
 }
 
-function buildChallengeLink(origin: string, challengerHandle: string, targetHandle: string): string {
-  return `${buildProfileUrl(origin, challengerHandle)}?challenge=${encodeURIComponent(targetHandle.toLowerCase())}`;
+function normalizeHandle(handle: string): string | null {
+  const normalized = handle.trim().toLowerCase();
+  if (!HANDLE_PATTERN.test(normalized)) {
+    return null;
+  }
+  return normalized;
+}
+
+function buildChallengeLink(origin: string, challengerHandle: string, targetHandle: string): string | null {
+  const normalizedChallenger = normalizeHandle(challengerHandle);
+  const normalizedTarget = normalizeHandle(targetHandle);
+  if (!normalizedChallenger || !normalizedTarget) {
+    return null;
+  }
+  return `${buildProfileUrl(origin, normalizedChallenger)}?challenge=${encodeURIComponent(normalizedTarget)}`;
 }
 
 function buildTweetIntentUrl(text: string, url: string): string {
   const params = new URLSearchParams({ text, url });
   return `https://twitter.com/intent/tweet?${params.toString()}`;
-}
-
-function buildInviteIntentUrl(origin: string): string {
-  return buildTweetIntentUrl('Track AI-verified throughput and challenge me on Mentat Velocity.', `${origin}/`);
 }
 
 function formatSignedDelta(value: number, maxFractionDigits = 1): string {
@@ -181,17 +191,37 @@ function formatRankDelta(previousRank: number, currentRank: number): string {
   return '0';
 }
 
-function parseRoute(pathname: string): Route {
+function parseChallengeQuery(search: string): { targetHandle: string | null; hasInvalidQuery: boolean } {
+  const params = new URLSearchParams(search);
+  const rawTarget = params.get('challenge');
+  if (!rawTarget) {
+    return { targetHandle: null, hasInvalidQuery: false };
+  }
+  const normalized = normalizeHandle(rawTarget);
+  if (!normalized) {
+    return { targetHandle: null, hasInvalidQuery: true };
+  }
+  return { targetHandle: normalized, hasInvalidQuery: false };
+}
+
+function parseRoute(pathname: string, search: string): Route {
   const profileMatch = pathname.match(/^\/v\/([A-Za-z0-9_.-]+)\/?$/);
   if (profileMatch) {
-    return { kind: 'profile', handle: profileMatch[1].toLowerCase() };
+    const challengeQuery = parseChallengeQuery(search);
+    return {
+      kind: 'profile',
+      handle: profileMatch[1].toLowerCase(),
+      challengeTargetHandle: challengeQuery.targetHandle,
+      hasInvalidChallengeQuery: challengeQuery.hasInvalidQuery,
+    };
   }
   return { kind: 'home' };
 }
 
 function routeToPath(route: Route): string {
   if (route.kind === 'profile') {
-    return `/v/${route.handle}`;
+    const challengeQuery = route.challengeTargetHandle ? `?challenge=${encodeURIComponent(route.challengeTargetHandle)}` : '';
+    return `/v/${route.handle}${challengeQuery}`;
   }
   return '/';
 }
@@ -332,9 +362,12 @@ function findNearestRival(entry: LeaderboardEntry, entries: LeaderboardEntry[]):
 
 export function App() {
   const [view, setView] = useState<View>('leaderboard');
-  const [route, setRoute] = useState<Route>(() => parseRoute(window.location.pathname));
+  const [route, setRoute] = useState<Route>(() => parseRoute(window.location.pathname, window.location.search));
   const [leaderboard, setLeaderboard] = useState<LeaderboardArtifact | null>(null);
   const [leaderboardError, setLeaderboardError] = useState<string | null>(null);
+  const [isLeaderboardRefreshing, setIsLeaderboardRefreshing] = useState(false);
+  const [lastLeaderboardRefreshAt, setLastLeaderboardRefreshAt] = useState<string | null>(null);
+  const [scanRefreshHint, setScanRefreshHint] = useState<string | null>(null);
   const [profileData, setProfileData] = useState<ProfileResponse | null>(null);
   const [profileError, setProfileError] = useState<string | null>(null);
   const [isProfileLoading, setIsProfileLoading] = useState(false);
@@ -350,7 +383,12 @@ export function App() {
   const [authError, setAuthError] = useState<string | null>(null);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
   const [isSigningOut, setIsSigningOut] = useState(false);
+  const [shareFeedback, setShareFeedback] = useState<string | null>(null);
   const profileVisitSignatureRef = useRef<string>('');
+  const challengeTelemetrySignatureRef = useRef<string>('');
+  const rivalryTelemetrySignatureRef = useRef<string>('');
+  const scanPersistenceSignatureRef = useRef<string>('');
+  const shareFeedbackTimerRef = useRef<number | null>(null);
 
   const loadAuthState = useCallback(async () => {
     setIsAuthLoading(true);
@@ -370,19 +408,44 @@ export function App() {
     void loadAuthState();
   }, [loadAuthState]);
 
-  useEffect(() => {
-    fetchLeaderboard()
-      .then((result) => {
+  const refreshLeaderboardArtifact = useCallback(
+    async (source: string) => {
+      setIsLeaderboardRefreshing(true);
+      trackUxEvent('leaderboard_refresh_requested', { source });
+      try {
+        const result = await fetchLeaderboard();
         setLeaderboard(result);
         setLeaderboardError(null);
-      })
-      .catch((error) => {
-        setLeaderboardError((error as Error).message);
-      });
-  }, []);
+        const refreshedAt = new Date().toISOString();
+        setLastLeaderboardRefreshAt(refreshedAt);
+        setScanRefreshHint(null);
+        trackUxEvent('leaderboard_refresh_completed', {
+          source,
+          entries: result.entries.length,
+        });
+      } catch (error) {
+        const message = (error as Error).message;
+        setLeaderboardError(message);
+        setScanRefreshHint(message);
+        trackUxEvent('leaderboard_refresh_failed', {
+          source,
+          reason: message,
+        });
+      } finally {
+        setIsLeaderboardRefreshing(false);
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
-    if (route.kind !== 'profile') {
+    void refreshLeaderboardArtifact('initial-load');
+  }, [refreshLeaderboardArtifact]);
+
+  const routeProfileHandle = route.kind === 'profile' ? route.handle : null;
+
+  useEffect(() => {
+    if (!routeProfileHandle) {
       setProfileData(null);
       setProfileError(null);
       setIsProfileLoading(false);
@@ -396,7 +459,7 @@ export function App() {
     setProfileError(null);
     setProfileData(null);
 
-    fetchProfile(route.handle)
+    fetchProfile(routeProfileHandle)
       .then((profile) => {
         if (cancelled) {
           return;
@@ -421,11 +484,11 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [route]);
+  }, [routeProfileHandle]);
 
   useEffect(() => {
     const onPopState = () => {
-      setRoute(parseRoute(window.location.pathname));
+      setRoute(parseRoute(window.location.pathname, window.location.search));
     };
 
     window.addEventListener('popstate', onPopState);
@@ -444,6 +507,28 @@ export function App() {
       window.removeEventListener('pageshow', onPageShow);
     };
   }, [loadAuthState]);
+
+  const setTransientShareFeedback = useCallback((message: string | null) => {
+    setShareFeedback(message);
+    if (shareFeedbackTimerRef.current !== null) {
+      window.clearTimeout(shareFeedbackTimerRef.current);
+      shareFeedbackTimerRef.current = null;
+    }
+    if (message) {
+      shareFeedbackTimerRef.current = window.setTimeout(() => {
+        setShareFeedback(null);
+        shareFeedbackTimerRef.current = null;
+      }, 2400);
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (shareFeedbackTimerRef.current !== null) {
+        window.clearTimeout(shareFeedbackTimerRef.current);
+      }
+    };
+  }, []);
 
   const sortedEntries = useMemo(() => sortByRank(leaderboard?.entries ?? []), [leaderboard]);
 
@@ -623,7 +708,8 @@ export function App() {
 
   function navigate(nextRoute: Route, options: { replace?: boolean } = {}) {
     const nextPath = routeToPath(nextRoute);
-    if (nextPath !== window.location.pathname) {
+    const currentPath = `${window.location.pathname}${window.location.search}`;
+    if (nextPath !== currentPath) {
       if (options.replace) {
         window.history.replaceState(null, '', nextPath);
       } else {
@@ -640,8 +726,13 @@ export function App() {
     navigate({ kind: 'home' });
   }
 
-  function openProfile(handle: string) {
-    navigate({ kind: 'profile', handle: handle.toLowerCase() });
+  function openProfile(handle: string, options: { challengeTargetHandle?: string | null } = {}) {
+    navigate({
+      kind: 'profile',
+      handle: handle.toLowerCase(),
+      challengeTargetHandle: options.challengeTargetHandle ?? null,
+      hasInvalidChallengeQuery: false,
+    });
   }
 
   async function onSignOut() {
@@ -669,11 +760,17 @@ export function App() {
     try {
       const result = await scanRepository(repoInput);
       setScanResult(result);
+      const persistence = result.persistence;
       trackUxEvent('scan_completed', {
         repo: `${result.repo.owner}/${result.repo.name}`,
         equivalentEngineeringHours: result.metrics.equivalentEngineeringHours,
         mergedPrsCiVerified: result.metrics.mergedPrs,
+        canonicalPersisted: Boolean(persistence?.canonicalLeaderboardWrite),
+        persistenceReason: persistence?.reason ?? 'missing',
       });
+      if (persistence?.canonicalLeaderboardWrite) {
+        void refreshLeaderboardArtifact('scan-auto-refresh');
+      }
     } catch (error) {
       setScanError((error as Error).message);
       setScanResult(null);
@@ -686,6 +783,101 @@ export function App() {
     }
   }
 
+  const copyLinkToClipboard = useCallback(async (url: string): Promise<boolean> => {
+    if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
+      return false;
+    }
+    try {
+      await navigator.clipboard.writeText(url);
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const triggerOutboundShare = useCallback(
+    async (params: {
+      event: string;
+      source: string;
+      title: string;
+      text: string;
+      url: string;
+      handle?: string;
+      challenger?: string;
+      target?: string;
+    }) => {
+      if (typeof navigator.share === 'function') {
+        try {
+          await navigator.share({
+            title: params.title,
+            text: params.text,
+            url: params.url,
+          });
+          trackUxEvent(params.event, {
+            source: params.source,
+            channel: 'native',
+            handle: params.handle ?? null,
+            challenger: params.challenger ?? null,
+            target: params.target ?? null,
+          });
+          setTransientShareFeedback('Shared via native dialog.');
+          return;
+        } catch (error) {
+          if ((error as Error).name === 'AbortError') {
+            trackUxEvent(params.event, {
+              source: params.source,
+              channel: 'native-cancelled',
+              handle: params.handle ?? null,
+              challenger: params.challenger ?? null,
+              target: params.target ?? null,
+            });
+            return;
+          }
+        }
+      }
+
+      const copied = await copyLinkToClipboard(params.url);
+      if (copied) {
+        trackUxEvent(params.event, {
+          source: params.source,
+          channel: 'copy-fallback',
+          handle: params.handle ?? null,
+          challenger: params.challenger ?? null,
+          target: params.target ?? null,
+        });
+        setTransientShareFeedback('Link copied to clipboard.');
+        return;
+      }
+
+      window.open(buildTweetIntentUrl(params.text, params.url), '_blank', 'noopener,noreferrer');
+      trackUxEvent(params.event, {
+        source: params.source,
+        channel: 'x-fallback',
+        handle: params.handle ?? null,
+        challenger: params.challenger ?? null,
+        target: params.target ?? null,
+      });
+      setTransientShareFeedback('Opened fallback share on X.');
+    },
+    [copyLinkToClipboard, setTransientShareFeedback],
+  );
+
+  const copyShareLink = useCallback(
+    async (params: { event: string; source: string; url: string; handle?: string; challenger?: string; target?: string }) => {
+      const copied = await copyLinkToClipboard(params.url);
+      trackUxEvent(params.event, {
+        source: params.source,
+        channel: 'copy-link',
+        success: copied,
+        handle: params.handle ?? null,
+        challenger: params.challenger ?? null,
+        target: params.target ?? null,
+      });
+      setTransientShareFeedback(copied ? 'Link copied to clipboard.' : 'Clipboard unavailable on this device.');
+    },
+    [copyLinkToClipboard, setTransientShareFeedback],
+  );
+
   const profileTrendPath = trendPoints.length > 1 ? buildTrendPath(trendPoints) : null;
   const globalRank = profileEntry
     ? (profileData?.leaderboard?.profile?.globalRank ?? profileEntry.profile?.globalRank ?? profileEntry.rank)
@@ -697,21 +889,30 @@ export function App() {
     ((normalizedAuthHandle !== null && route.handle === normalizedAuthHandle) ||
       (normalizedAuthLogin !== null && route.handle === normalizedAuthLogin));
   const appOrigin = window.location.origin;
-  const currentActorHandle = authIdentity?.handle ?? profileEntry?.handle ?? 'open-challenge';
-  const inviteIntentUrl = buildInviteIntentUrl(appOrigin);
-  const profileShareIntentUrl = profileEntry
-    ? buildTweetIntentUrl(
-        `My Mentat Velocity snapshot: #${globalRank ?? profileEntry.rank}, ${formatNumber(profileEntry.totals.equivalentEngineeringHours, 1)} EEH in 30d.`,
-        buildProfileUrl(appOrigin, profileEntry.handle),
-      )
-    : null;
-  const profileChallengeIntentUrl =
-    profileEntry && profileRival
-      ? buildTweetIntentUrl(
-          `I challenge @${profileRival.handle} on Mentat Velocity. Compare our trusted throughput.`,
-          buildChallengeLink(appOrigin, currentActorHandle, profileRival.handle),
-        )
-      : null;
+  const challengeActorHandle = authIdentity?.handle ?? profileEntry?.handle ?? null;
+  const normalizedActorHandle = challengeActorHandle?.toLowerCase() ?? null;
+  const currentActorHandleForTelemetry = challengeActorHandle ?? 'unclaimed';
+  const inviteShareUrl = `${appOrigin}/`;
+  const routeChallengeTargetHandle = route.kind === 'profile' ? route.challengeTargetHandle : null;
+  const challengeTargetEntry = useMemo(() => {
+    if (!routeChallengeTargetHandle) {
+      return null;
+    }
+    return sortedEntries.find((entry) => entry.handle === routeChallengeTargetHandle) ?? null;
+  }, [routeChallengeTargetHandle, sortedEntries]);
+  const profileChallengeComparison = useMemo(() => {
+    if (!profileEntry || !challengeTargetEntry) {
+      return null;
+    }
+    return {
+      eehDelta: profileEntry.totals.equivalentEngineeringHours - challengeTargetEntry.totals.equivalentEngineeringHours,
+      ciPrDelta: profileEntry.totals.mergedPrsCiVerified - challengeTargetEntry.totals.mergedPrsCiVerified,
+      accelerationDelta: profileEntry.totals.velocityAcceleration - challengeTargetEntry.totals.velocityAcceleration,
+    };
+  }, [challengeTargetEntry, profileEntry]);
+  const profileShareUrl = profileEntry ? buildProfileUrl(appOrigin, profileEntry.handle) : null;
+  const profileChallengeUrl =
+    profileEntry && profileRival && challengeActorHandle ? buildChallengeLink(appOrigin, challengeActorHandle, profileRival.handle) : null;
   const profileRivalEehDelta =
     profileEntry && profileRival ? profileEntry.totals.equivalentEngineeringHours - profileRival.totals.equivalentEngineeringHours : null;
   const scanComparisonEntry = useMemo(
@@ -742,12 +943,9 @@ export function App() {
       accelerationDelta: scanResult.metrics.velocityAcceleration - scanComparisonEntry.totals.velocityAcceleration,
     };
   }, [scanComparisonEntry, scanResult]);
-  const scanChallengeIntentUrl =
-    scanResult && scanComparisonEntry
-      ? buildTweetIntentUrl(
-          `Scan challenge: can your throughput beat @${scanComparisonEntry.handle}?`,
-          buildChallengeLink(appOrigin, currentActorHandle, scanComparisonEntry.handle),
-        )
+  const scanChallengeUrl =
+    scanResult && scanComparisonEntry && challengeActorHandle
+      ? buildChallengeLink(appOrigin, challengeActorHandle, scanComparisonEntry.handle)
       : null;
   const profileVisitDelta = useMemo(() => {
     if (!profileEntry || !lastProfileVisit) {
@@ -772,20 +970,140 @@ export function App() {
     }
     return clamp(7 - daysSince, 0, 7);
   }, [lastProfileVisit]);
-  const normalizedActorHandle = currentActorHandle.toLowerCase();
-  const defaultChallengeTarget = sortedEntries.find((entry) => entry.handle !== normalizedActorHandle) ?? null;
-  const myProfileShareIntentUrl = authIdentity
-    ? buildTweetIntentUrl(
-        `My Mentat Velocity profile is live. Benchmark my AI-verified throughput.`,
-        buildProfileUrl(appOrigin, authIdentity.handle),
-      )
-    : null;
-  const leaderboardChallengeIntentUrl = defaultChallengeTarget
-    ? buildTweetIntentUrl(
-        `Open challenge: @${defaultChallengeTarget.handle}, let's compare AI-verified throughput on Mentat Velocity.`,
-        buildChallengeLink(appOrigin, currentActorHandle, defaultChallengeTarget.handle),
-      )
-    : null;
+  const defaultChallengeTarget = sortedEntries.find((entry) => (normalizedActorHandle ? entry.handle !== normalizedActorHandle : true)) ?? null;
+  const myProfileShareUrl = authIdentity ? buildProfileUrl(appOrigin, authIdentity.handle) : null;
+  const leaderboardChallengeUrl =
+    defaultChallengeTarget && challengeActorHandle ? buildChallengeLink(appOrigin, challengeActorHandle, defaultChallengeTarget.handle) : null;
+  const scanPersistenceSummary = useMemo(() => {
+    if (!scanResult) {
+      return null;
+    }
+    const persistence = scanResult.persistence;
+    if (!persistence) {
+      return {
+        tone: 'border-slate-700/80 bg-slate-900/50 text-ink-2',
+        heading: 'Canonical persistence status unavailable',
+        detail: 'This response did not include persistence metadata. Ranking impact remains unverified.',
+      };
+    }
+    if (persistence.canonicalLeaderboardWrite && persistence.reason === 'persisted') {
+      return {
+        tone: 'border-emerald-400/45 bg-emerald-500/10 text-emerald-100',
+        heading: `Canonical leaderboard write confirmed for @${persistence.ownerHandle}`,
+        detail: 'This scan can influence trusted ranking once the leaderboard snapshot refreshes.',
+      };
+    }
+    if (persistence.reason === 'unauthenticated') {
+      return {
+        tone: 'border-amber-400/50 bg-amber-400/10 text-amber-100',
+        heading: 'Scan completed, but canonical write was skipped',
+        detail: `Sign in as @${persistence.ownerHandle} to persist this repo owner into canonical leaderboard ranking.`,
+      };
+    }
+    if (persistence.reason === 'owner-mismatch') {
+      return {
+        tone: 'border-amber-400/50 bg-amber-400/10 text-amber-100',
+        heading: 'Scan completed under the wrong identity',
+        detail: `Signed in as @${persistence.actorHandle ?? 'unknown'}, but canonical owner is @${persistence.ownerHandle}.`,
+      };
+    }
+    return {
+      tone: 'border-rose-400/45 bg-rose-500/10 text-rose-100',
+      heading: 'Canonical write unavailable',
+      detail: 'Persistence backend was unavailable, so ranking impact was not recorded.',
+    };
+  }, [scanResult]);
+  const rivalryProgression = useMemo(() => {
+    if (!profileEntry || !profileRival) {
+      return null;
+    }
+    if (profileData?.rivalry) {
+      return profileData.rivalry;
+    }
+    if (!profileData || profileData.history.length < 2) {
+      return null;
+    }
+    const latest = profileData.history[0];
+    const previous = profileData.history[1];
+    const rankDelta = previous.rank - latest.rank;
+    const eehDelta = latest.equivalentEngineeringHours - previous.equivalentEngineeringHours;
+    const trend = rankDelta > 0 || eehDelta > 0 ? 'closing' : rankDelta < 0 || eehDelta < 0 ? 'widening' : 'stable';
+    return {
+      rivalHandle: profileRival.handle,
+      source: 'history-derived',
+      capturedAt: latest.capturedAt,
+      trend,
+      rankDelta,
+      equivalentEngineeringHoursDelta: eehDelta,
+      currentGapEquivalentEngineeringHours: profileEntry.totals.equivalentEngineeringHours - profileRival.totals.equivalentEngineeringHours,
+      currentGapRank: profileRival.rank - profileEntry.rank,
+    };
+  }, [profileData, profileEntry, profileRival]);
+
+  useEffect(() => {
+    if (route.kind !== 'profile') {
+      challengeTelemetrySignatureRef.current = '';
+      return;
+    }
+    if (!route.challengeTargetHandle && !route.hasInvalidChallengeQuery) {
+      challengeTelemetrySignatureRef.current = '';
+      return;
+    }
+    const resolution = route.hasInvalidChallengeQuery
+      ? 'invalid-query'
+      : !profileEntry
+        ? 'challenger-missing'
+        : !challengeTargetEntry
+          ? 'target-missing'
+          : challengeTargetEntry.handle === profileEntry.handle
+            ? 'self-target'
+            : 'compare-ready';
+    const signature = `${route.handle}:${route.challengeTargetHandle ?? 'none'}:${Number(route.hasInvalidChallengeQuery)}:${resolution}`;
+    if (challengeTelemetrySignatureRef.current === signature) {
+      return;
+    }
+    challengeTelemetrySignatureRef.current = signature;
+    trackUxEvent('challenge_deep_link_resolved', {
+      challenger: route.handle,
+      target: route.challengeTargetHandle ?? null,
+      resolution,
+      signedIn: Boolean(authIdentity),
+    });
+  }, [authIdentity, challengeTargetEntry, profileEntry, route]);
+
+  useEffect(() => {
+    if (route.kind !== 'profile' || !rivalryProgression) {
+      rivalryTelemetrySignatureRef.current = '';
+      return;
+    }
+    const signature = `${profileEntry?.handle ?? 'none'}:${rivalryProgression.rivalHandle}:${rivalryProgression.capturedAt}:${rivalryProgression.trend}`;
+    if (rivalryTelemetrySignatureRef.current === signature) {
+      return;
+    }
+    rivalryTelemetrySignatureRef.current = signature;
+    trackUxEvent('rivalry_progression_viewed', {
+      handle: profileEntry?.handle ?? route.handle,
+      rival: rivalryProgression.rivalHandle,
+      source: rivalryProgression.source,
+      trend: rivalryProgression.trend,
+    });
+  }, [profileEntry, route, rivalryProgression]);
+
+  useEffect(() => {
+    if (!scanResult || !scanPersistenceSummary) {
+      scanPersistenceSignatureRef.current = '';
+      return;
+    }
+    const signature = `${scanResult.scannedAt}:${scanResult.persistence?.reason ?? 'missing'}:${Number(scanResult.persistence?.canonicalLeaderboardWrite)}`;
+    if (scanPersistenceSignatureRef.current === signature) {
+      return;
+    }
+    scanPersistenceSignatureRef.current = signature;
+    trackUxEvent('scan_persistence_status_viewed', {
+      reason: scanResult.persistence?.reason ?? 'missing',
+      canonicalPersisted: Boolean(scanResult.persistence?.canonicalLeaderboardWrite),
+    });
+  }, [scanPersistenceSummary, scanResult]);
 
   return (
     <div className="min-h-screen bg-app text-ink-1 font-sans">
@@ -860,6 +1178,9 @@ export function App() {
       </header>
 
       <main className="mx-auto max-w-7xl px-4 py-6 md:px-6 lg:px-8">
+        {shareFeedback ? (
+          <p className="mb-4 rounded-lg border border-cyan-400/40 bg-cyan-500/10 px-3 py-2 text-xs font-mono text-cyan-100">{shareFeedback}</p>
+        ) : null}
         {route.kind === 'profile' ? (
           isProfileLoading && !profileEntry ? (
             <section className="rounded-xl border border-slate-700/80 bg-surface-1 p-5 shadow-soft">
@@ -897,56 +1218,173 @@ export function App() {
                   </div>
                 </div>
                 <div className="mt-4 flex flex-wrap items-center gap-2">
-                  {profileShareIntentUrl ? (
-                    <a
-                      className="rounded-lg border border-cyan-400/60 bg-cyan-500/10 px-3 py-2 text-xs font-mono text-cyan-100 hover:bg-cyan-500/20"
-                      href={profileShareIntentUrl}
-                      onClick={() =>
-                        trackUxEvent('profile_share_clicked', {
-                          handle: profileEntry.handle,
-                          source: 'profile_header',
-                        })
-                      }
-                      rel="noreferrer"
-                      target="_blank"
-                    >
-                      Share Profile
-                    </a>
+                  {profileShareUrl ? (
+                    <>
+                      <button
+                        className="min-h-11 rounded-lg border border-cyan-400/60 bg-cyan-500/10 px-3 py-2 text-xs font-mono text-cyan-100 hover:bg-cyan-500/20"
+                        onClick={() =>
+                          void triggerOutboundShare({
+                            event: 'profile_share_clicked',
+                            source: 'profile_header',
+                            handle: profileEntry.handle,
+                            title: 'Mentat Velocity Profile',
+                            text: `My Mentat Velocity snapshot: #${globalRank ?? profileEntry.rank}, ${formatNumber(profileEntry.totals.equivalentEngineeringHours, 1)} EEH in 30d.`,
+                            url: profileShareUrl,
+                          })
+                        }
+                        type="button"
+                      >
+                        Share Profile
+                      </button>
+                      <button
+                        className="min-h-11 rounded-lg border border-cyan-400/40 px-3 py-2 text-xs font-mono text-cyan-100 hover:bg-cyan-500/15"
+                        onClick={() =>
+                          void copyShareLink({
+                            event: 'profile_share_clicked',
+                            source: 'profile_header',
+                            handle: profileEntry.handle,
+                            url: profileShareUrl,
+                          })
+                        }
+                        type="button"
+                      >
+                        Copy Link
+                      </button>
+                    </>
                   ) : null}
-                  {profileChallengeIntentUrl && profileRival ? (
+                  {profileChallengeUrl && profileRival ? (
+                    <>
+                      <button
+                        className="min-h-11 rounded-lg border border-amber-400/50 bg-amber-400/10 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/20"
+                        onClick={() =>
+                          void triggerOutboundShare({
+                            event: 'challenge_link_clicked',
+                            source: 'profile_header',
+                            challenger: currentActorHandleForTelemetry,
+                            target: profileRival.handle,
+                            title: 'Mentat Velocity Challenge',
+                            text: `I challenge @${profileRival.handle} on Mentat Velocity. Compare our trusted throughput.`,
+                            url: profileChallengeUrl,
+                          })
+                        }
+                        type="button"
+                      >
+                        Challenge @{profileRival.handle}
+                      </button>
+                      <button
+                        className="min-h-11 rounded-lg border border-amber-400/40 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/12"
+                        onClick={() =>
+                          void copyShareLink({
+                            event: 'challenge_link_clicked',
+                            source: 'profile_header',
+                            challenger: currentActorHandleForTelemetry,
+                            target: profileRival.handle,
+                            url: profileChallengeUrl,
+                          })
+                        }
+                        type="button"
+                      >
+                        Copy Challenge
+                      </button>
+                    </>
+                  ) : challengeActorHandle === null ? (
                     <a
-                      className="rounded-lg border border-amber-400/50 bg-amber-400/10 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/20"
-                      href={profileChallengeIntentUrl}
-                      onClick={() =>
-                        trackUxEvent('challenge_link_clicked', {
-                          challenger: currentActorHandle,
-                          target: profileRival.handle,
-                          source: 'profile_header',
-                        })
-                      }
-                      rel="noreferrer"
-                      target="_blank"
+                      className="min-h-11 inline-flex items-center rounded-lg border border-amber-400/40 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/10"
+                      href="/api/auth/github/start"
+                      onClick={() => trackUxEvent('claim_profile_clicked', { source: 'profile_header_challenge_gate', signedIn: false })}
                     >
-                      Challenge @{profileRival.handle}
+                      Sign in to Challenge
                     </a>
                   ) : (
                     <span className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-mono text-ink-3">Challenge link unavailable: no comparable rival yet.</span>
                   )}
-                  <a
-                    className="rounded-lg border border-slate-600 px-3 py-2 text-xs font-mono text-ink-2 hover:border-cyan-400 hover:text-ink-1"
-                    href={inviteIntentUrl}
+                  <button
+                    className="min-h-11 rounded-lg border border-slate-600 px-3 py-2 text-xs font-mono text-ink-2 hover:border-cyan-400 hover:text-ink-1"
                     onClick={() =>
-                      trackUxEvent('invite_link_clicked', {
+                      void triggerOutboundShare({
+                        event: 'invite_link_clicked',
                         source: 'profile_header',
                         handle: profileEntry.handle,
+                        title: 'Mentat Velocity',
+                        text: 'Track AI-verified throughput and challenge me on Mentat Velocity.',
+                        url: inviteShareUrl,
                       })
                     }
-                    rel="noreferrer"
-                    target="_blank"
+                    type="button"
                   >
                     Invite Peer
-                  </a>
+                  </button>
+                  <button
+                    className="min-h-11 rounded-lg border border-slate-600 px-3 py-2 text-xs font-mono text-ink-2 hover:border-cyan-400 hover:text-ink-1"
+                    onClick={() =>
+                      void copyShareLink({
+                        event: 'invite_link_clicked',
+                        source: 'profile_header',
+                        handle: profileEntry.handle,
+                        url: inviteShareUrl,
+                      })
+                    }
+                    type="button"
+                  >
+                    Copy Invite Link
+                  </button>
                 </div>
+                {route.hasInvalidChallengeQuery ? (
+                  <p className="mt-3 rounded-lg border border-amber-400/40 bg-amber-400/10 px-3 py-2 text-xs leading-relaxed text-amber-100">
+                    Challenge link was invalid. Use “Copy Challenge” to generate a valid compare URL.
+                  </p>
+                ) : null}
+                {route.challengeTargetHandle ? (
+                  challengeTargetEntry && challengeTargetEntry.handle !== profileEntry.handle && profileChallengeComparison ? (
+                    <div className="mt-3 rounded-lg border border-amber-400/40 bg-amber-400/10 p-3">
+                      <p className="font-mono text-xs uppercase tracking-[0.08em] text-amber-100">Challenge Matchup</p>
+                      <p className="mt-1 text-sm text-amber-100">
+                        @{profileEntry.handle} vs @{challengeTargetEntry.handle}
+                      </p>
+                      <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-3">
+                        <p className="rounded border border-amber-400/40 px-2 py-1 text-xs text-amber-100">
+                          EEH delta {formatSignedDelta(profileChallengeComparison.eehDelta, 1)}
+                        </p>
+                        <p className="rounded border border-amber-400/40 px-2 py-1 text-xs text-amber-100">
+                          CI PR delta {formatSignedDelta(profileChallengeComparison.ciPrDelta, 0)}
+                        </p>
+                        <p className="rounded border border-amber-400/40 px-2 py-1 text-xs text-amber-100">
+                          Accel delta {formatAcceleration(profileChallengeComparison.accelerationDelta)}
+                        </p>
+                      </div>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        <button
+                          className="min-h-11 rounded-md border border-amber-300/60 bg-amber-400/20 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/30"
+                          onClick={() => openProfile(challengeTargetEntry.handle)}
+                          type="button"
+                        >
+                          Open @{challengeTargetEntry.handle}
+                        </button>
+                        {challengeActorHandle ? (
+                          <button
+                            className="min-h-11 rounded-md border border-amber-300/60 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/18"
+                            onClick={() =>
+                              void copyShareLink({
+                                event: 'challenge_link_clicked',
+                                source: 'challenge_deeplink_panel',
+                                challenger: currentActorHandleForTelemetry,
+                                target: challengeTargetEntry.handle,
+                                url: buildChallengeLink(appOrigin, challengeActorHandle, challengeTargetEntry.handle) ?? buildProfileUrl(appOrigin, profileEntry.handle),
+                              })
+                            }
+                            type="button"
+                          >
+                            Copy Challenge Link
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="mt-3 rounded-lg border border-amber-400/40 bg-amber-400/10 px-3 py-2 text-xs leading-relaxed text-amber-100">
+                      Challenge target @{route.challengeTargetHandle} is not available in the current leaderboard snapshot.
+                    </p>
+                  )
+                ) : null}
                 <p className="mt-4 max-w-4xl rounded-lg border border-slate-700 bg-surface-2 px-3 py-2 text-xs leading-relaxed text-ink-2">{profileAttributionSummary}</p>
 
                 <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-5">
@@ -1020,6 +1458,39 @@ export function App() {
                         Last visit snapshot: {new Date(profileVisitDelta.previousCapturedAt).toLocaleString()} ({profileVisitDelta.daysSince} day(s) ago)
                       </p>
                     ) : null}
+                  </div>
+                  <div className="rounded-lg border border-cyan-400/40 bg-cyan-500/10 p-3 lg:col-span-3">
+                    <p className="font-mono text-xs uppercase tracking-[0.08em] text-cyan-100">Rivalry Progression (Server-Backed)</p>
+                    {rivalryProgression ? (
+                      <>
+                        <p className="mt-1 text-sm text-cyan-100">
+                          vs @{rivalryProgression.rivalHandle}:{' '}
+                          {rivalryProgression.trend === 'closing'
+                            ? 'you are closing the gap.'
+                            : rivalryProgression.trend === 'widening'
+                              ? 'the gap widened in the latest snapshot.'
+                              : 'gap unchanged in the latest snapshot.'}
+                        </p>
+                        <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-3">
+                          <p className="rounded border border-cyan-300/40 px-2 py-1 text-xs text-cyan-100">
+                            Rank delta {formatSignedDelta(rivalryProgression.rankDelta, 0)}
+                          </p>
+                          <p className="rounded border border-cyan-300/40 px-2 py-1 text-xs text-cyan-100">
+                            EEH delta {formatSignedDelta(rivalryProgression.equivalentEngineeringHoursDelta, 1)}
+                          </p>
+                          <p className="rounded border border-cyan-300/40 px-2 py-1 text-xs text-cyan-100">
+                            Current EEH gap {formatSignedDelta(rivalryProgression.currentGapEquivalentEngineeringHours, 1)}
+                          </p>
+                        </div>
+                        <p className="mt-2 font-mono text-xs text-cyan-200">
+                          Source: {rivalryProgression.source} at {new Date(rivalryProgression.capturedAt).toLocaleString()}
+                        </p>
+                      </>
+                    ) : (
+                      <p className="mt-1 text-sm text-cyan-100">
+                        Rivalry progression unavailable until at least two profile history snapshots are persisted.
+                      </p>
+                    )}
                   </div>
                 </div>
               </div>
@@ -1156,17 +1627,46 @@ export function App() {
           ) : (
             <section className="rounded-xl border border-slate-700/80 bg-surface-1 p-5 shadow-soft">
               <h2 className="font-display text-2xl">Profile Not Found</h2>
-              <p className="mt-2 text-sm text-ink-2">
-                No seeded profile matched @{route.handle}. Choose a handle from the leaderboard.
-              </p>
+              {route.challengeTargetHandle && challengeTargetEntry ? (
+                <p className="mt-2 text-sm text-ink-2">
+                  Challenge link target @{challengeTargetEntry.handle} is valid, but challenger profile @{route.handle} is not claimable yet.
+                </p>
+              ) : (
+                <p className="mt-2 text-sm text-ink-2">
+                  No seeded profile matched @{route.handle}. Choose a handle from the leaderboard.
+                </p>
+              )}
+              {route.hasInvalidChallengeQuery ? (
+                <p className="mt-2 text-sm text-amber-200">Challenge query was invalid and could not be resolved.</p>
+              ) : null}
               {profileError ? <p className="mt-2 text-sm text-state-warning">Profile API: {profileError}</p> : null}
-              <button
-                className="mt-4 rounded-lg border border-slate-700 px-3 py-2 text-sm text-ink-2 hover:border-cyan-400 hover:text-ink-1"
-                onClick={() => goHome('leaderboard')}
-                type="button"
-              >
-                Return to leaderboard
-              </button>
+              <div className="mt-4 flex flex-wrap gap-2">
+                {route.challengeTargetHandle && challengeTargetEntry ? (
+                  <button
+                    className="min-h-11 rounded-lg border border-cyan-400/50 bg-cyan-500/10 px-3 py-2 text-sm text-cyan-100 hover:bg-cyan-500/20"
+                    onClick={() => openProfile(challengeTargetEntry.handle)}
+                    type="button"
+                  >
+                    Open @{challengeTargetEntry.handle}
+                  </button>
+                ) : null}
+                {!authIdentity ? (
+                  <a
+                    className="min-h-11 inline-flex items-center rounded-lg border border-amber-400/40 px-3 py-2 text-sm text-amber-100 hover:bg-amber-400/10"
+                    href="/api/auth/github/start"
+                    onClick={() => trackUxEvent('claim_profile_clicked', { source: 'challenge_not_found_gate', signedIn: false })}
+                  >
+                    Claim Profile to Challenge
+                  </a>
+                ) : null}
+                <button
+                  className="min-h-11 rounded-lg border border-slate-700 px-3 py-2 text-sm text-ink-2 hover:border-cyan-400 hover:text-ink-1"
+                  onClick={() => goHome('leaderboard')}
+                  type="button"
+                >
+                  Return to leaderboard
+                </button>
+              </div>
             </section>
           )
         ) : (
@@ -1203,56 +1703,120 @@ export function App() {
                 </div>
 
                 <div className="mt-4 flex flex-wrap items-center gap-2">
-                  {myProfileShareIntentUrl ? (
-                    <a
-                      className="rounded-lg border border-cyan-400/60 bg-cyan-500/10 px-3 py-2 text-xs font-mono text-cyan-100 hover:bg-cyan-500/20"
-                      href={myProfileShareIntentUrl}
-                      onClick={() =>
-                        trackUxEvent('profile_share_clicked', {
-                          source: 'home_hero',
-                          handle: authIdentity?.handle ?? 'signed-out',
-                        })
-                      }
-                      rel="noreferrer"
-                      target="_blank"
-                    >
-                      Share My Profile
-                    </a>
+                  {myProfileShareUrl ? (
+                    <>
+                      <button
+                        className="min-h-11 rounded-lg border border-cyan-400/60 bg-cyan-500/10 px-3 py-2 text-xs font-mono text-cyan-100 hover:bg-cyan-500/20"
+                        onClick={() =>
+                          void triggerOutboundShare({
+                            event: 'profile_share_clicked',
+                            source: 'home_hero',
+                            handle: authIdentity?.handle ?? 'signed-out',
+                            title: 'Mentat Velocity Profile',
+                            text: 'My Mentat Velocity profile is live. Benchmark my AI-verified throughput.',
+                            url: myProfileShareUrl,
+                          })
+                        }
+                        type="button"
+                      >
+                        Share My Profile
+                      </button>
+                      <button
+                        className="min-h-11 rounded-lg border border-cyan-400/40 px-3 py-2 text-xs font-mono text-cyan-100 hover:bg-cyan-500/15"
+                        onClick={() =>
+                          void copyShareLink({
+                            event: 'profile_share_clicked',
+                            source: 'home_hero',
+                            handle: authIdentity?.handle ?? 'signed-out',
+                            url: myProfileShareUrl,
+                          })
+                        }
+                        type="button"
+                      >
+                        Copy Link
+                      </button>
+                    </>
                   ) : (
                     <a
-                      className="rounded-lg border border-slate-600 px-3 py-2 text-xs font-mono text-ink-2 hover:border-cyan-400 hover:text-ink-1"
+                      className="min-h-11 inline-flex items-center rounded-lg border border-slate-600 px-3 py-2 text-xs font-mono text-ink-2 hover:border-cyan-400 hover:text-ink-1"
                       href="/api/auth/github/start"
                       onClick={() => trackUxEvent('claim_profile_clicked', { source: 'home_hero', signedIn: false })}
                     >
                       Sign in to Claim Profile
                     </a>
                   )}
-                  {leaderboardChallengeIntentUrl && defaultChallengeTarget ? (
+                  {leaderboardChallengeUrl && defaultChallengeTarget ? (
+                    <>
+                      <button
+                        className="min-h-11 rounded-lg border border-amber-400/50 bg-amber-400/10 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/20"
+                        onClick={() =>
+                          void triggerOutboundShare({
+                            event: 'challenge_link_clicked',
+                            source: 'home_hero',
+                            challenger: currentActorHandleForTelemetry,
+                            target: defaultChallengeTarget.handle,
+                            title: 'Mentat Velocity Challenge',
+                            text: `Open challenge: @${defaultChallengeTarget.handle}, let's compare AI-verified throughput on Mentat Velocity.`,
+                            url: leaderboardChallengeUrl,
+                          })
+                        }
+                        type="button"
+                      >
+                        Challenge @{defaultChallengeTarget.handle}
+                      </button>
+                      <button
+                        className="min-h-11 rounded-lg border border-amber-400/40 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/12"
+                        onClick={() =>
+                          void copyShareLink({
+                            event: 'challenge_link_clicked',
+                            source: 'home_hero',
+                            challenger: currentActorHandleForTelemetry,
+                            target: defaultChallengeTarget.handle,
+                            url: leaderboardChallengeUrl,
+                          })
+                        }
+                        type="button"
+                      >
+                        Copy Challenge
+                      </button>
+                    </>
+                  ) : (
                     <a
-                      className="rounded-lg border border-amber-400/50 bg-amber-400/10 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/20"
-                      href={leaderboardChallengeIntentUrl}
-                      onClick={() =>
-                        trackUxEvent('challenge_link_clicked', {
-                          source: 'home_hero',
-                          challenger: currentActorHandle,
-                          target: defaultChallengeTarget.handle,
-                        })
-                      }
-                      rel="noreferrer"
-                      target="_blank"
+                      className="min-h-11 inline-flex items-center rounded-lg border border-amber-400/40 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/10"
+                      href="/api/auth/github/start"
+                      onClick={() => trackUxEvent('claim_profile_clicked', { source: 'home_hero_challenge_gate', signedIn: false })}
                     >
-                      Challenge @{defaultChallengeTarget.handle}
+                      Claim Profile to Challenge
                     </a>
-                  ) : null}
-                  <a
-                    className="rounded-lg border border-slate-600 px-3 py-2 text-xs font-mono text-ink-2 hover:border-cyan-400 hover:text-ink-1"
-                    href={inviteIntentUrl}
-                    onClick={() => trackUxEvent('invite_link_clicked', { source: 'home_hero' })}
-                    rel="noreferrer"
-                    target="_blank"
+                  )}
+                  <button
+                    className="min-h-11 rounded-lg border border-slate-600 px-3 py-2 text-xs font-mono text-ink-2 hover:border-cyan-400 hover:text-ink-1"
+                    onClick={() =>
+                      void triggerOutboundShare({
+                        event: 'invite_link_clicked',
+                        source: 'home_hero',
+                        title: 'Mentat Velocity',
+                        text: 'Track AI-verified throughput and challenge me on Mentat Velocity.',
+                        url: inviteShareUrl,
+                      })
+                    }
+                    type="button"
                   >
                     Invite Peer
-                  </a>
+                  </button>
+                  <button
+                    className="min-h-11 rounded-lg border border-slate-600 px-3 py-2 text-xs font-mono text-ink-2 hover:border-cyan-400 hover:text-ink-1"
+                    onClick={() =>
+                      void copyShareLink({
+                        event: 'invite_link_clicked',
+                        source: 'home_hero',
+                        url: inviteShareUrl,
+                      })
+                    }
+                    type="button"
+                  >
+                    Copy Invite Link
+                  </button>
                 </div>
 
                 <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -1273,13 +1837,28 @@ export function App() {
 
               {view === 'leaderboard' ? (
                 <section className="rounded-xl border border-slate-700/80 bg-surface-1 p-4 shadow-soft md:p-5">
-                  <div className="mb-4 flex items-center justify-between">
-                    <h3 className="font-display text-xl">Rankings</h3>
-                    <p className="font-mono text-xs text-ink-3">
-                      {leaderboard?.generatedAt
-                        ? `Static bootstrap snapshot: ${new Date(leaderboard.generatedAt).toLocaleString()}`
-                        : 'No artifact generated yet'}
-                    </p>
+                  <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <h3 className="font-display text-xl">Rankings</h3>
+                      <p className="font-mono text-xs text-ink-3">
+                        {leaderboard?.generatedAt
+                          ? `Static bootstrap snapshot: ${new Date(leaderboard.generatedAt).toLocaleString()}`
+                          : 'No artifact generated yet'}
+                      </p>
+                      {lastLeaderboardRefreshAt ? (
+                        <p className="font-mono text-xs text-emerald-200">Refreshed: {new Date(lastLeaderboardRefreshAt).toLocaleString()}</p>
+                      ) : null}
+                    </div>
+                    <button
+                      className="min-h-11 rounded-md border border-slate-600 px-3 py-2 text-xs font-mono text-ink-2 hover:border-cyan-400 hover:text-ink-1 disabled:opacity-60"
+                      disabled={isLeaderboardRefreshing}
+                      onClick={() => {
+                        void refreshLeaderboardArtifact('leaderboard-manual');
+                      }}
+                      type="button"
+                    >
+                      {isLeaderboardRefreshing ? 'Refreshing...' : 'Refresh Leaderboard'}
+                    </button>
                   </div>
                   <p className="mb-4 rounded-md border border-slate-700 bg-surface-2 px-3 py-2 text-xs text-ink-2">
                     Methodology: EEH and ranking use CI-verified merged PRs on the default branch; unverified merged PR totals are shown for transparency.
@@ -1298,14 +1877,11 @@ export function App() {
                       const percentile = getPercentile(entry, sortedEntries.length);
                       const nextHigher = sortedEntries.find((candidate) => candidate.rank === entry.rank - 1) ?? null;
                       const eehGapToNext = nextHigher ? nextHigher.totals.equivalentEngineeringHours - entry.totals.equivalentEngineeringHours : null;
-                      const shareEntryIntentUrl = buildTweetIntentUrl(
-                        `Mentat Velocity profile check: @${entry.handle} is currently #${entry.rank}.`,
-                        buildProfileUrl(appOrigin, entry.handle),
-                      );
-                      const challengeEntryIntentUrl = buildTweetIntentUrl(
-                        `I challenge @${entry.handle} on Mentat Velocity.`,
-                        buildChallengeLink(appOrigin, currentActorHandle, entry.handle),
-                      );
+                      const shareEntryUrl = buildProfileUrl(appOrigin, entry.handle);
+                      const challengeEntryUrl =
+                        challengeActorHandle && entry.handle !== normalizedActorHandle
+                          ? buildChallengeLink(appOrigin, challengeActorHandle, entry.handle)
+                          : null;
                       return (
                         <div key={`${entry.handle}-mobile`} className="rounded-lg border border-slate-700 bg-slate-950/35 p-3">
                           <div className="flex items-center justify-between gap-2">
@@ -1344,35 +1920,63 @@ export function App() {
                             </div>
                           )}
                           <div className="mt-3 flex items-center gap-2">
-                            <a
-                              className="rounded border border-cyan-400/50 bg-cyan-500/10 px-2.5 py-1 text-[11px] font-mono text-cyan-100 hover:bg-cyan-500/20"
-                              href={shareEntryIntentUrl}
+                            <button
+                              className="min-h-11 min-w-11 rounded border border-cyan-400/50 bg-cyan-500/10 px-3 py-2 text-[11px] font-mono text-cyan-100 hover:bg-cyan-500/20"
                               onClick={() =>
-                                trackUxEvent('profile_share_clicked', {
+                                void triggerOutboundShare({
+                                  event: 'profile_share_clicked',
                                   source: 'leaderboard_mobile_row',
                                   handle: entry.handle,
+                                  title: 'Mentat Velocity Profile',
+                                  text: `Mentat Velocity profile check: @${entry.handle} is currently #${entry.rank}.`,
+                                  url: shareEntryUrl,
                                 })
                               }
-                              rel="noreferrer"
-                              target="_blank"
+                              type="button"
                             >
                               Share
-                            </a>
-                            <a
-                              className="rounded border border-amber-400/50 bg-amber-400/10 px-2.5 py-1 text-[11px] font-mono text-amber-100 hover:bg-amber-400/20"
-                              href={challengeEntryIntentUrl}
+                            </button>
+                            <button
+                              className="min-h-11 min-w-11 rounded border border-cyan-400/40 px-3 py-2 text-[11px] font-mono text-cyan-100 hover:bg-cyan-500/15"
                               onClick={() =>
-                                trackUxEvent('challenge_link_clicked', {
+                                void copyShareLink({
+                                  event: 'profile_share_clicked',
                                   source: 'leaderboard_mobile_row',
-                                  challenger: currentActorHandle,
-                                  target: entry.handle,
+                                  handle: entry.handle,
+                                  url: shareEntryUrl,
                                 })
                               }
-                              rel="noreferrer"
-                              target="_blank"
+                              type="button"
                             >
-                              Challenge
-                            </a>
+                              Copy
+                            </button>
+                            {challengeEntryUrl ? (
+                              <button
+                                className="min-h-11 min-w-11 rounded border border-amber-400/50 bg-amber-400/10 px-3 py-2 text-[11px] font-mono text-amber-100 hover:bg-amber-400/20"
+                                onClick={() =>
+                                  void triggerOutboundShare({
+                                    event: 'challenge_link_clicked',
+                                    source: 'leaderboard_mobile_row',
+                                    challenger: currentActorHandleForTelemetry,
+                                    target: entry.handle,
+                                    title: 'Mentat Velocity Challenge',
+                                    text: `I challenge @${entry.handle} on Mentat Velocity.`,
+                                    url: challengeEntryUrl,
+                                  })
+                                }
+                                type="button"
+                              >
+                                Challenge
+                              </button>
+                            ) : (
+                              <a
+                                className="min-h-11 inline-flex items-center rounded border border-amber-400/40 px-3 py-2 text-[11px] font-mono text-amber-100 hover:bg-amber-400/10"
+                                href="/api/auth/github/start"
+                                onClick={() => trackUxEvent('claim_profile_clicked', { source: 'leaderboard_mobile_row_challenge_gate', signedIn: false })}
+                              >
+                                Claim to Challenge
+                              </a>
+                            )}
                           </div>
                         </div>
                       );
@@ -1436,41 +2040,63 @@ export function App() {
                               )}
                               {entry.scanInsight ? <p className="font-mono text-xs text-ink-3">{entry.scanInsight}</p> : null}
                               <div className="mt-2 flex flex-wrap gap-2">
-                                <a
-                                  className="rounded border border-cyan-400/50 bg-cyan-500/10 px-2 py-1 font-mono text-[11px] text-cyan-100 hover:bg-cyan-500/20"
-                                  href={buildTweetIntentUrl(
-                                    `Mentat Velocity profile check: @${entry.handle} is currently #${entry.rank}.`,
-                                    buildProfileUrl(appOrigin, entry.handle),
-                                  )}
+                                <button
+                                  className="min-h-11 rounded border border-cyan-400/50 bg-cyan-500/10 px-3 py-2 font-mono text-[11px] text-cyan-100 hover:bg-cyan-500/20"
                                   onClick={() =>
-                                    trackUxEvent('profile_share_clicked', {
+                                    void triggerOutboundShare({
+                                      event: 'profile_share_clicked',
                                       source: 'leaderboard_table_row',
                                       handle: entry.handle,
+                                      title: 'Mentat Velocity Profile',
+                                      text: `Mentat Velocity profile check: @${entry.handle} is currently #${entry.rank}.`,
+                                      url: buildProfileUrl(appOrigin, entry.handle),
                                     })
                                   }
-                                  rel="noreferrer"
-                                  target="_blank"
+                                  type="button"
                                 >
                                   Share
-                                </a>
-                                <a
-                                  className="rounded border border-amber-400/50 bg-amber-400/10 px-2 py-1 font-mono text-[11px] text-amber-100 hover:bg-amber-400/20"
-                                  href={buildTweetIntentUrl(
-                                    `I challenge @${entry.handle} on Mentat Velocity.`,
-                                    buildChallengeLink(appOrigin, currentActorHandle, entry.handle),
-                                  )}
+                                </button>
+                                <button
+                                  className="min-h-11 rounded border border-cyan-400/40 px-3 py-2 font-mono text-[11px] text-cyan-100 hover:bg-cyan-500/15"
                                   onClick={() =>
-                                    trackUxEvent('challenge_link_clicked', {
+                                    void copyShareLink({
+                                      event: 'profile_share_clicked',
                                       source: 'leaderboard_table_row',
-                                      challenger: currentActorHandle,
-                                      target: entry.handle,
+                                      handle: entry.handle,
+                                      url: buildProfileUrl(appOrigin, entry.handle),
                                     })
                                   }
-                                  rel="noreferrer"
-                                  target="_blank"
+                                  type="button"
                                 >
-                                  Challenge
-                                </a>
+                                  Copy
+                                </button>
+                                {challengeActorHandle && entry.handle !== normalizedActorHandle ? (
+                                  <button
+                                    className="min-h-11 rounded border border-amber-400/50 bg-amber-400/10 px-3 py-2 font-mono text-[11px] text-amber-100 hover:bg-amber-400/20"
+                                    onClick={() =>
+                                      void triggerOutboundShare({
+                                        event: 'challenge_link_clicked',
+                                        source: 'leaderboard_table_row',
+                                        challenger: currentActorHandleForTelemetry,
+                                        target: entry.handle,
+                                        title: 'Mentat Velocity Challenge',
+                                        text: `I challenge @${entry.handle} on Mentat Velocity.`,
+                                        url: buildChallengeLink(appOrigin, challengeActorHandle, entry.handle) ?? buildProfileUrl(appOrigin, entry.handle),
+                                      })
+                                    }
+                                    type="button"
+                                  >
+                                    Challenge
+                                  </button>
+                                ) : (
+                                  <a
+                                    className="min-h-11 inline-flex items-center rounded border border-amber-400/40 px-3 py-2 font-mono text-[11px] text-amber-100 hover:bg-amber-400/10"
+                                    href="/api/auth/github/start"
+                                    onClick={() => trackUxEvent('claim_profile_clicked', { source: 'leaderboard_table_row_challenge_gate', signedIn: false })}
+                                  >
+                                    Claim to Challenge
+                                  </a>
+                                )}
                               </div>
                             </td>
                             <td className="px-2 py-3">
@@ -1576,29 +2202,68 @@ export function App() {
 
                       <div className="mt-4 rounded-lg border border-cyan-500/40 bg-cyan-500/10 p-3">
                         <p className="font-mono text-xs uppercase tracking-[0.08em] text-cyan-100">Post-Scan Leaderboard Lane</p>
+                        {scanPersistenceSummary ? (
+                          <div className={`mt-3 rounded-md border px-3 py-2 text-xs leading-relaxed ${scanPersistenceSummary.tone}`}>
+                            <p className="font-mono uppercase tracking-[0.08em]">{scanPersistenceSummary.heading}</p>
+                            <p className="mt-1">{scanPersistenceSummary.detail}</p>
+                          </div>
+                        ) : null}
                         <div className="mt-3 flex flex-wrap items-center gap-2">
-                          {authIdentity ? (
+                          {scanResult.persistence?.canonicalLeaderboardWrite ? (
                             <button
-                              className="rounded-md border border-cyan-300/60 bg-cyan-500/20 px-3 py-2 text-xs font-mono text-cyan-100 hover:bg-cyan-500/30"
+                              className="min-h-11 rounded-md border border-cyan-300/60 bg-cyan-500/20 px-3 py-2 text-xs font-mono text-cyan-100 hover:bg-cyan-500/30"
+                              onClick={() => {
+                                const ownerHandle = scanResult.persistence?.ownerHandle ?? authIdentity?.handle;
+                                if (!ownerHandle) {
+                                  return;
+                                }
+                                trackUxEvent('claim_profile_clicked', { source: 'scan_lane_persisted', signedIn: Boolean(authIdentity), handle: ownerHandle });
+                                openProfile(ownerHandle);
+                              }}
+                              type="button"
+                            >
+                              View Canonical Profile
+                            </button>
+                          ) : authIdentity ? (
+                            <button
+                              className="min-h-11 rounded-md border border-cyan-300/60 bg-cyan-500/20 px-3 py-2 text-xs font-mono text-cyan-100 hover:bg-cyan-500/30"
                               onClick={() => {
                                 trackUxEvent('claim_profile_clicked', { source: 'scan_lane', signedIn: true, handle: authIdentity.handle });
                                 openProfile(authIdentity.handle);
                               }}
                               type="button"
                             >
-                              Claim/View My Profile
+                              View My Profile
                             </button>
                           ) : (
                             <a
-                              className="rounded-md border border-cyan-300/60 bg-cyan-500/20 px-3 py-2 text-xs font-mono text-cyan-100 hover:bg-cyan-500/30"
+                              className="min-h-11 inline-flex items-center rounded-md border border-cyan-300/60 bg-cyan-500/20 px-3 py-2 text-xs font-mono text-cyan-100 hover:bg-cyan-500/30"
                               href="/api/auth/github/start"
-                              onClick={() => trackUxEvent('claim_profile_clicked', { source: 'scan_lane', signedIn: false })}
+                              onClick={() =>
+                                trackUxEvent('claim_profile_clicked', {
+                                  source: 'scan_lane',
+                                  signedIn: false,
+                                  ownerHandle: scanResult.persistence?.ownerHandle ?? null,
+                                })
+                              }
                             >
-                              Sign in to Claim Profile
+                              {scanResult.persistence?.reason === 'unauthenticated' && scanResult.persistence.ownerHandle
+                                ? `Sign in as @${scanResult.persistence.ownerHandle}`
+                                : 'Sign in to Claim Profile'}
                             </a>
                           )}
                           <button
-                            className="rounded-md border border-slate-600 px-3 py-2 text-xs font-mono text-ink-1 hover:border-cyan-400"
+                            className="min-h-11 rounded-md border border-slate-600 px-3 py-2 text-xs font-mono text-ink-1 hover:border-cyan-400"
+                            onClick={() => {
+                              void refreshLeaderboardArtifact('scan-lane-manual');
+                              trackUxEvent('scan_lane_refresh_clicked', { source: 'scan_lane', canonicalPersisted: Boolean(scanResult.persistence?.canonicalLeaderboardWrite) });
+                            }}
+                            type="button"
+                          >
+                            {isLeaderboardRefreshing ? 'Refreshing...' : 'Refresh Leaderboard'}
+                          </button>
+                          <button
+                            className="min-h-11 rounded-md border border-slate-600 px-3 py-2 text-xs font-mono text-ink-1 hover:border-cyan-400"
                             onClick={() => {
                               setView('leaderboard');
                               trackUxEvent('scan_to_leaderboard_clicked', { source: 'scan_lane' });
@@ -1607,24 +2272,60 @@ export function App() {
                           >
                             View Ranking Impact
                           </button>
-                          {scanChallengeIntentUrl && scanComparisonEntry ? (
+                          {scanChallengeUrl && scanComparisonEntry ? (
+                            <>
+                              <button
+                                className="min-h-11 rounded-md border border-amber-400/50 bg-amber-400/10 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/20"
+                                onClick={() =>
+                                  void triggerOutboundShare({
+                                    event: 'challenge_link_clicked',
+                                    source: 'scan_lane',
+                                    challenger: currentActorHandleForTelemetry,
+                                    target: scanComparisonEntry.handle,
+                                    title: 'Mentat Velocity Challenge',
+                                    text: `Scan challenge: can your throughput beat @${scanComparisonEntry.handle}?`,
+                                    url: scanChallengeUrl,
+                                  })
+                                }
+                                type="button"
+                              >
+                                Challenge @{scanComparisonEntry.handle}
+                              </button>
+                              <button
+                                className="min-h-11 rounded-md border border-amber-400/40 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/15"
+                                onClick={() =>
+                                  void copyShareLink({
+                                    event: 'challenge_link_clicked',
+                                    source: 'scan_lane',
+                                    challenger: currentActorHandleForTelemetry,
+                                    target: scanComparisonEntry.handle,
+                                    url: scanChallengeUrl,
+                                  })
+                                }
+                                type="button"
+                              >
+                                Copy Challenge
+                              </button>
+                            </>
+                          ) : challengeActorHandle === null ? (
                             <a
-                              className="rounded-md border border-amber-400/50 bg-amber-400/10 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/20"
-                              href={scanChallengeIntentUrl}
+                              className="min-h-11 inline-flex items-center rounded-md border border-amber-400/40 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/10"
+                              href="/api/auth/github/start"
                               onClick={() =>
-                                trackUxEvent('challenge_link_clicked', {
-                                  source: 'scan_lane',
-                                  challenger: currentActorHandle,
-                                  target: scanComparisonEntry.handle,
+                                trackUxEvent('claim_profile_clicked', {
+                                  source: 'scan_lane_challenge_gate',
+                                  signedIn: false,
                                 })
                               }
-                              rel="noreferrer"
-                              target="_blank"
                             >
-                              Challenge @{scanComparisonEntry.handle}
+                              Claim Profile to Challenge
                             </a>
                           ) : null}
                         </div>
+                        {scanRefreshHint ? <p className="mt-2 text-xs text-rose-200">Refresh failed: {scanRefreshHint}</p> : null}
+                        {lastLeaderboardRefreshAt ? (
+                          <p className="mt-2 font-mono text-xs text-cyan-200">Last refresh: {new Date(lastLeaderboardRefreshAt).toLocaleString()}</p>
+                        ) : null}
 
                         <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
                           <div className="rounded-md border border-slate-700 bg-surface-2 p-3">

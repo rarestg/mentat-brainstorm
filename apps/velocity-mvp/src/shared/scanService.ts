@@ -1,6 +1,6 @@
-import { fetchCommitsForWindow, fetchMergedPrsForWindow } from './github';
+import { fetchCommitsForWindow, fetchMergedPrsForWindow, resolveCanonicalRepoIdentity } from './github';
 import { buildMetrics, computeWindowSummary } from './metrics';
-import { parseRepoUrl, toRepoUrl, type RepoRef } from './repoUrl';
+import { parseRepoUrl, type RepoRef } from './repoUrl';
 import type { AttributionTransparency, RepoReportCard } from './types';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -105,20 +105,25 @@ export async function scanRepoByUrl(repoUrl: string, token?: string, options?: S
 export async function scanRepo(ref: RepoRef, token?: string, options?: ScanOptions): Promise<RepoReportCard> {
   const { now, currentStart, previousStart } = getWindows();
   const attribution = resolveAttribution(options);
+  const repoIdentity = await resolveCanonicalRepoIdentity(ref, token);
+  const canonicalRef: RepoRef = {
+    owner: repoIdentity.canonicalOwner,
+    repo: repoIdentity.canonicalRepo,
+  };
   const authoredOptions =
     attribution.mode === 'handle-authored' && attribution.targetHandle
       ? { authoredByHandle: attribution.targetHandle }
       : undefined;
 
-  const [currentCommits, previousCommits, currentMergedPrsResult, previousMergedPrsResult] = await Promise.all([
-    fetchCommitsForWindow(ref, currentStart.toISOString(), now.toISOString(), token, authoredOptions),
-    fetchCommitsForWindow(ref, previousStart.toISOString(), currentStart.toISOString(), token, authoredOptions),
-    fetchMergedPrsForWindow(ref, currentStart.toISOString(), now.toISOString(), token, authoredOptions),
-    fetchMergedPrsForWindow(ref, previousStart.toISOString(), currentStart.toISOString(), token, authoredOptions),
+  const [currentCommitsResult, previousCommitsResult, currentMergedPrsResult, previousMergedPrsResult] = await Promise.all([
+    fetchCommitsForWindow(canonicalRef, currentStart.toISOString(), now.toISOString(), token, authoredOptions),
+    fetchCommitsForWindow(canonicalRef, previousStart.toISOString(), currentStart.toISOString(), token, authoredOptions),
+    fetchMergedPrsForWindow(canonicalRef, currentStart.toISOString(), now.toISOString(), token, authoredOptions),
+    fetchMergedPrsForWindow(canonicalRef, previousStart.toISOString(), currentStart.toISOString(), token, authoredOptions),
   ]);
 
   const currentSummary = computeWindowSummary({
-    commits: currentCommits,
+    commits: currentCommitsResult.commits,
     mergedPrs: currentMergedPrsResult.mergedPrs,
     ciVerifiedMergedPrs: currentMergedPrsResult.ciVerifiedMergedPrs,
     start: currentStart,
@@ -128,7 +133,7 @@ export async function scanRepo(ref: RepoRef, token?: string, options?: ScanOptio
   });
 
   const previousSummary = computeWindowSummary({
-    commits: previousCommits,
+    commits: previousCommitsResult.commits,
     mergedPrs: previousMergedPrsResult.mergedPrs,
     ciVerifiedMergedPrs: previousMergedPrsResult.ciVerifiedMergedPrs,
     start: previousStart,
@@ -146,9 +151,9 @@ export async function scanRepo(ref: RepoRef, token?: string, options?: ScanOptio
 
   return {
     repo: {
-      owner: ref.owner,
-      name: ref.repo,
-      url: toRepoUrl(ref),
+      owner: canonicalRef.owner,
+      name: canonicalRef.repo,
+      url: repoIdentity.canonicalUrl,
     },
     scannedAt: now.toISOString(),
     attribution,
@@ -162,6 +167,11 @@ export async function scanRepo(ref: RepoRef, token?: string, options?: ScanOptio
       ciVerification: ciVerificationAssumption,
     },
     metadata: {
+      repoIdentity,
+      commitIngestion: {
+        current30d: currentCommitsResult.ingestion,
+        previous30d: previousCommitsResult.ingestion,
+      },
       mergedPrIngestion: {
         current30d: currentMergedPrsResult.ingestion,
         previous30d: previousMergedPrsResult.ingestion,

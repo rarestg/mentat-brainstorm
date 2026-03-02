@@ -41,7 +41,11 @@ const PROFILE_CACHE_CONTROL = 'public, max-age=60, s-maxage=120, stale-while-rev
 const SHARE_CACHE_CONTROL = 'public, max-age=300, s-maxage=300, stale-while-revalidate=900';
 const REFRESH_LOCK_NAME = 'seed-refresh';
 const REFRESH_LOCK_TABLE_NAME = 'refresh_locks';
-const REFRESH_LOCK_TTL_SECONDS = 15 * 60;
+const REFRESH_LOCK_TTL_SECONDS_DEFAULT = 15 * 60;
+const REFRESH_LOCK_TTL_SECONDS_MIN = 30;
+const REFRESH_LOCK_HEARTBEAT_MS_DEFAULT = 30 * 1000;
+const REFRESH_LOCK_HEARTBEAT_MS_MIN = 200;
+const REFRESH_LOCK_HEARTBEAT_RATIO_MAX = 0.5;
 const RETENTION_WINDOWS_DAYS = {
   scans: 180,
   snapshots: 180,
@@ -60,6 +64,8 @@ type WorkerBindings = Env & {
   OAUTH_TOKEN_ENCRYPTION_KEY?: string;
   REFRESH_ADMIN_HANDLES?: string;
   SESSION_TTL_HOURS?: string;
+  REFRESH_LOCK_TTL_SECONDS?: string;
+  REFRESH_LOCK_HEARTBEAT_MS?: string;
   DB?: D1Database;
 };
 
@@ -68,6 +74,7 @@ type SessionAuthResult =
   | { ok: false; response: Response };
 
 type WorkerContext = Context<{ Bindings: WorkerBindings }>;
+type PublicCacheVersionToken = `${number}:${number}`;
 
 export const app = new Hono<{ Bindings: WorkerBindings }>();
 
@@ -81,6 +88,26 @@ function sessionTtlSeconds(env: WorkerBindings): number {
     return Math.floor(configured * 60 * 60);
   }
   return DEFAULT_SESSION_TTL_HOURS * 60 * 60;
+}
+
+function refreshLockTtlSeconds(env: WorkerBindings): number {
+  const configured = Number(env.REFRESH_LOCK_TTL_SECONDS);
+  if (Number.isFinite(configured) && configured >= REFRESH_LOCK_TTL_SECONDS_MIN) {
+    return Math.floor(configured);
+  }
+  return REFRESH_LOCK_TTL_SECONDS_DEFAULT;
+}
+
+function refreshLockHeartbeatMs(env: WorkerBindings, ttlSeconds: number): number {
+  const configured = Number(env.REFRESH_LOCK_HEARTBEAT_MS);
+  const upperBound = Math.max(
+    REFRESH_LOCK_HEARTBEAT_MS_MIN,
+    Math.floor(ttlSeconds * 1000 * REFRESH_LOCK_HEARTBEAT_RATIO_MAX),
+  );
+  if (Number.isFinite(configured) && configured >= REFRESH_LOCK_HEARTBEAT_MS_MIN) {
+    return Math.min(Math.floor(configured), upperBound);
+  }
+  return Math.min(REFRESH_LOCK_HEARTBEAT_MS_DEFAULT, upperBound);
 }
 
 function baseCookieOptions(env: WorkerBindings): {
@@ -363,51 +390,85 @@ function applyPublicCacheHeaders(response: Response, cacheControl: string, cache
   return response;
 }
 
-function buildEdgeCacheRequest(requestUrl: string, cacheVersion: number): Request {
+function createPublicCacheVersionToken(refreshVersion: number, canonicalScanVersion: number): PublicCacheVersionToken {
+  const boundedRefreshVersion = Math.max(0, Math.floor(refreshVersion));
+  const boundedScanVersion = Math.max(0, Math.floor(canonicalScanVersion));
+  return `${boundedRefreshVersion}:${boundedScanVersion}`;
+}
+
+function buildEdgeCacheRequest(requestUrl: string, cacheVersion: PublicCacheVersionToken): Request {
   const cacheUrl = new URL(requestUrl);
   cacheUrl.hash = '';
-  cacheUrl.searchParams.set('__cv', String(cacheVersion));
+  cacheUrl.searchParams.set('__cv', cacheVersion);
   return new Request(cacheUrl.toString(), { method: 'GET' });
 }
 
-function localPublicCacheKey(cacheVersion: number, cacheKey: string): string {
+function localPublicCacheKey(cacheVersion: PublicCacheVersionToken, cacheKey: string): string {
   return `${PUBLIC_CACHE_KEY_PREFIX}${cacheVersion}:${cacheKey}`;
 }
 
-function invalidatePublicReadCaches(nextCacheVersion?: number): void {
+function invalidatePublicReadCaches(nextCacheVersion?: PublicCacheVersionToken): void {
   deleteCachedByPrefix(PUBLIC_CACHE_KEY_PREFIX);
-  if (typeof nextCacheVersion === 'number' && Number.isFinite(nextCacheVersion) && nextCacheVersion >= 0) {
-    setCached(PUBLIC_CACHE_VERSION_KEY, Math.floor(nextCacheVersion), PUBLIC_CACHE_VERSION_TTL_MS);
+  if (typeof nextCacheVersion === 'string' && nextCacheVersion.length > 0) {
+    setCached(PUBLIC_CACHE_VERSION_KEY, nextCacheVersion, PUBLIC_CACHE_VERSION_TTL_MS);
   }
 }
 
-async function resolvePublicCacheVersion(env: WorkerBindings): Promise<number> {
-  const cached = getCached<number>(PUBLIC_CACHE_VERSION_KEY);
-  if (typeof cached === 'number' && Number.isFinite(cached)) {
-    return cached;
+async function resolvePublicCacheVersion(
+  env: WorkerBindings,
+  options: { bypassLocalCache?: boolean } = {},
+): Promise<PublicCacheVersionToken> {
+  if (!options.bypassLocalCache) {
+    const cached = getCached<PublicCacheVersionToken>(PUBLIC_CACHE_VERSION_KEY);
+    if (typeof cached === 'string' && cached.length > 0) {
+      return cached;
+    }
   }
 
+  const emptyVersion = createPublicCacheVersionToken(0, 0);
   if (!hasD1Prepare(env.DB)) {
-    return 0;
+    return emptyVersion;
   }
 
   try {
     const row = await env.DB
-      .prepare(`SELECT COALESCE(MAX(id), 0) AS version FROM refresh_runs WHERE status = 'success'`)
-      .first<{ version?: unknown }>();
-    const version = Math.max(0, toFiniteNumber(row?.version));
+      .prepare(
+        `SELECT
+           COALESCE((SELECT MAX(id) FROM refresh_runs WHERE status = 'success'), 0) AS refresh_version,
+           COALESCE((SELECT MAX(id) FROM snapshots), 0) AS canonical_scan_version`,
+      )
+      .first<{ refresh_version?: unknown; canonical_scan_version?: unknown }>();
+    const version = createPublicCacheVersionToken(
+      toFiniteNumber(row?.refresh_version),
+      toFiniteNumber(row?.canonical_scan_version),
+    );
     setCached(PUBLIC_CACHE_VERSION_KEY, version, PUBLIC_CACHE_VERSION_TTL_MS);
     return version;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.warn(`[cache] failed to resolve refresh-based cache version, using 0: ${message}`);
-    return 0;
+    console.warn(`[cache] failed to resolve cache version token, using ${emptyVersion}: ${message}`);
+    return emptyVersion;
+  }
+}
+
+async function invalidatePublicReadCachesFromDb(env: WorkerBindings): Promise<PublicCacheVersionToken | undefined> {
+  invalidatePublicReadCaches();
+  if (!hasD1Prepare(env.DB)) {
+    return undefined;
+  }
+
+  try {
+    return await resolvePublicCacheVersion(env, { bypassLocalCache: true });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[cache] failed to prime cache version after canonical write: ${message}`);
+    return undefined;
   }
 }
 
 interface CachedJsonResponseOptions<T> {
   cacheKey: string;
-  cacheVersion: number;
+  cacheVersion: PublicCacheVersionToken;
   localTtlMs: number;
   cacheControl: string;
   skipCache?: boolean;
@@ -483,6 +544,25 @@ class RefreshLockConflictError extends Error {
   }
 }
 
+class RefreshLockLostError extends Error {
+  ownerId: string;
+  reason: string;
+
+  constructor(ownerId: string, reason: string) {
+    super(`Seed refresh lock was lost for owner ${ownerId}: ${reason}`);
+    this.name = 'RefreshLockLostError';
+    this.ownerId = ownerId;
+    this.reason = reason;
+  }
+}
+
+interface RefreshLockHeartbeatMonitor {
+  intervalMs: number;
+  ttlSeconds: number;
+  assertHealthy: () => void;
+  stop: () => Promise<void>;
+}
+
 async function ensureRefreshLockTable(db: D1Database): Promise<void> {
   await db
     .prepare(
@@ -504,11 +584,15 @@ async function readCurrentRefreshLock(db: D1Database): Promise<RefreshLockRow | 
     .first<RefreshLockRow>();
 }
 
-async function acquireRefreshLock(db: D1Database, trigger: 'manual' | 'scheduled'): Promise<RefreshLockTicket | null> {
+async function acquireRefreshLock(
+  db: D1Database,
+  trigger: 'manual' | 'scheduled',
+  ttlSeconds: number,
+): Promise<RefreshLockTicket | null> {
   await ensureRefreshLockTable(db);
   const ownerId = `${trigger}:${crypto.randomUUID()}`;
   const acquiredAt = new Date().toISOString();
-  const expiresAt = new Date(Date.now() + REFRESH_LOCK_TTL_SECONDS * 1000).toISOString();
+  const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
 
   const result = await db
     .prepare(
@@ -528,6 +612,78 @@ async function acquireRefreshLock(db: D1Database, trigger: 'manual' | 'scheduled
     return null;
   }
   return { ownerId };
+}
+
+async function renewRefreshLock(db: D1Database, ownerId: string, ttlSeconds: number): Promise<boolean> {
+  const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+  const result = await db
+    .prepare(
+      `UPDATE ${REFRESH_LOCK_TABLE_NAME}
+       SET expires_at = ?
+       WHERE lock_name = ?
+         AND lock_owner = ?
+         AND datetime(expires_at) > datetime('now')`,
+    )
+    .bind(expiresAt, REFRESH_LOCK_NAME, ownerId)
+    .run();
+
+  const changes = toFiniteNumber((result as { meta?: { changes?: unknown } }).meta?.changes);
+  return changes > 0;
+}
+
+function startRefreshLockHeartbeat(
+  db: D1Database,
+  ownerId: string,
+  ttlSeconds: number,
+  intervalMs: number,
+): RefreshLockHeartbeatMonitor {
+  let active = true;
+  let failureReason: string | null = null;
+  let inFlight: Promise<void> | null = null;
+
+  const pulse = async (): Promise<void> => {
+    if (!active || failureReason || inFlight) {
+      return;
+    }
+
+    inFlight = (async () => {
+      try {
+        const renewed = await renewRefreshLock(db, ownerId, ttlSeconds);
+        if (!renewed) {
+          failureReason = 'lock-expired-or-stolen';
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        failureReason = `heartbeat-error:${message}`;
+      }
+    })().finally(() => {
+      inFlight = null;
+    });
+
+    await inFlight;
+  };
+
+  const interval = setInterval(() => {
+    void pulse();
+  }, intervalMs);
+  void pulse();
+
+  return {
+    intervalMs,
+    ttlSeconds,
+    assertHealthy: () => {
+      if (failureReason) {
+        throw new RefreshLockLostError(ownerId, failureReason);
+      }
+    },
+    stop: async () => {
+      active = false;
+      clearInterval(interval);
+      if (inFlight) {
+        await inFlight;
+      }
+    },
+  };
 }
 
 async function releaseRefreshLock(db: D1Database, ownerId: string): Promise<void> {
@@ -620,6 +776,11 @@ async function runRetentionCleanup(db: D1Database): Promise<RetentionCleanupResu
 interface SeedRefreshExecutionResult {
   refresh: Awaited<ReturnType<typeof refreshLeaderboardFromSeed>>;
   retention: RetentionCleanupResult | null;
+  cacheVersion?: PublicCacheVersionToken;
+  lock: {
+    ttlSeconds: number;
+    heartbeatMs: number;
+  };
 }
 
 async function requireAuthenticatedSession(c: WorkerContext): Promise<SessionAuthResult> {
@@ -711,21 +872,35 @@ async function runSeedRefresh(env: WorkerBindings, trigger: 'manual' | 'schedule
     throw new Error('DB binding is required for seed refresh operations.');
   }
 
+  const lockTtlSeconds = refreshLockTtlSeconds(env);
+  const lockHeartbeatMs = refreshLockHeartbeatMs(env, lockTtlSeconds);
+
   if (!hasD1Prepare(env.DB)) {
     const refresh = await refreshLeaderboardFromSeed(env.DB, seedCreators as SeedCreator[], env.GITHUB_TOKEN, trigger);
-    invalidatePublicReadCaches(refresh.runId);
-    return { refresh, retention: null } satisfies SeedRefreshExecutionResult;
+    const cacheVersion = await invalidatePublicReadCachesFromDb(env);
+    return {
+      refresh,
+      retention: null,
+      cacheVersion,
+      lock: {
+        ttlSeconds: lockTtlSeconds,
+        heartbeatMs: lockHeartbeatMs,
+      },
+    } satisfies SeedRefreshExecutionResult;
   }
 
-  const ticket = await acquireRefreshLock(env.DB, trigger);
+  const ticket = await acquireRefreshLock(env.DB, trigger, lockTtlSeconds);
   if (!ticket) {
     const active = await readCurrentRefreshLock(env.DB);
     throw new RefreshLockConflictError(active?.lock_owner ?? null, active?.expires_at ?? null);
   }
 
+  const heartbeat = startRefreshLockHeartbeat(env.DB, ticket.ownerId, lockTtlSeconds, lockHeartbeatMs);
   try {
+    heartbeat.assertHealthy();
     const refresh = await refreshLeaderboardFromSeed(env.DB, seedCreators as SeedCreator[], env.GITHUB_TOKEN, trigger);
-    invalidatePublicReadCaches(refresh.runId);
+    heartbeat.assertHealthy();
+    const cacheVersion = await invalidatePublicReadCachesFromDb(env);
 
     let retention: RetentionCleanupResult | null = null;
     try {
@@ -735,8 +910,17 @@ async function runSeedRefresh(env: WorkerBindings, trigger: 'manual' | 'schedule
       console.error(`[retention] cleanup failed after ${trigger} refresh: ${message}`);
     }
 
-    return { refresh, retention } satisfies SeedRefreshExecutionResult;
+    return {
+      refresh,
+      retention,
+      cacheVersion,
+      lock: {
+        ttlSeconds: lockTtlSeconds,
+        heartbeatMs: lockHeartbeatMs,
+      },
+    } satisfies SeedRefreshExecutionResult;
   } finally {
+    await heartbeat.stop();
     try {
       await releaseRefreshLock(env.DB, ticket.ownerId);
     } catch (error) {
@@ -822,48 +1006,99 @@ app.post('/api/scan', async (c) => {
   }
 
   try {
-    const report = await scanRepoByUrl(parsed.data.repoUrl, c.env?.GITHUB_TOKEN);
-    let persistence:
-      | {
-          canonicalLeaderboardWrite: true;
-          reason: 'persisted';
-          ownerHandle: string;
-          actorHandle: string;
-        }
-      | {
-          canonicalLeaderboardWrite: false;
-          reason: 'db-unavailable' | 'unauthenticated' | 'owner-mismatch';
-          ownerHandle: string;
-          actorHandle?: string;
-        } = {
+    const identity = c.env?.DB ? await resolveOptionalSessionIdentity(c) : null;
+    const actorGitHubHandle = identity?.providerLogin?.trim().toLowerCase();
+    const report = await scanRepoByUrl(parsed.data.repoUrl, c.env?.GITHUB_TOKEN, {
+      attribution: actorGitHubHandle
+        ? {
+            mode: 'handle-authored',
+            handle: actorGitHubHandle,
+          }
+        : undefined,
+    });
+    const ownerHandle = report.repo.owner.trim().toLowerCase();
+    const requestedOwnerHandle = report.metadata?.repoIdentity?.requestedOwner?.trim().toLowerCase();
+    const canonicalOwnerResolved = report.metadata?.repoIdentity?.canonicalOwnerResolved ?? true;
+    const requestedOwnerDiffers = requestedOwnerHandle && requestedOwnerHandle !== ownerHandle;
+    const attributionTargetHandle = report.attribution.targetHandle?.trim().toLowerCase();
+    const strictHandleAttribution =
+      report.attribution.mode === 'handle-authored' &&
+      report.attribution.strict &&
+      !!actorGitHubHandle &&
+      attributionTargetHandle === actorGitHubHandle;
+
+    let persistence: NonNullable<typeof report.persistence> = {
       canonicalLeaderboardWrite: false,
+      rankingEligible: false,
       reason: c.env?.DB ? 'unauthenticated' : 'db-unavailable',
-      ownerHandle: report.repo.owner.toLowerCase(),
+      ownerHandle,
+      requestedOwnerHandle: requestedOwnerDiffers ? requestedOwnerHandle : undefined,
+      attributionMode: report.attribution.mode,
+      attributionStrict: report.attribution.strict,
+      canonicalOwnerResolved,
     };
 
     if (c.env?.DB) {
-      const identity = await resolveOptionalSessionIdentity(c);
-      const ownerHandle = report.repo.owner.trim().toLowerCase();
       if (!identity) {
         persistence = {
           canonicalLeaderboardWrite: false,
+          rankingEligible: false,
           reason: 'unauthenticated',
           ownerHandle,
+          requestedOwnerHandle: requestedOwnerDiffers ? requestedOwnerHandle : undefined,
+          attributionMode: report.attribution.mode,
+          attributionStrict: report.attribution.strict,
+          canonicalOwnerResolved,
         };
-      } else if (identity.handle.trim().toLowerCase() !== ownerHandle) {
+      } else if (!canonicalOwnerResolved) {
         persistence = {
           canonicalLeaderboardWrite: false,
+          rankingEligible: false,
+          reason: 'owner-unresolved',
+          ownerHandle,
+          requestedOwnerHandle: requestedOwnerDiffers ? requestedOwnerHandle : undefined,
+          actorHandle: identity.handle,
+          attributionMode: report.attribution.mode,
+          attributionStrict: report.attribution.strict,
+          canonicalOwnerResolved,
+        };
+      } else if (!actorGitHubHandle || actorGitHubHandle !== ownerHandle) {
+        persistence = {
+          canonicalLeaderboardWrite: false,
+          rankingEligible: false,
           reason: 'owner-mismatch',
           ownerHandle,
+          requestedOwnerHandle: requestedOwnerDiffers ? requestedOwnerHandle : undefined,
           actorHandle: identity.handle,
+          attributionMode: report.attribution.mode,
+          attributionStrict: report.attribution.strict,
+          canonicalOwnerResolved,
+        };
+      } else if (!strictHandleAttribution) {
+        persistence = {
+          canonicalLeaderboardWrite: false,
+          rankingEligible: false,
+          reason: 'non-canonical-attribution',
+          ownerHandle,
+          requestedOwnerHandle: requestedOwnerDiffers ? requestedOwnerHandle : undefined,
+          actorHandle: identity.handle,
+          attributionMode: report.attribution.mode,
+          attributionStrict: report.attribution.strict,
+          canonicalOwnerResolved,
         };
       } else {
         await persistScanReport(c.env.DB, report);
+        await invalidatePublicReadCachesFromDb(c.env);
         persistence = {
           canonicalLeaderboardWrite: true,
+          rankingEligible: true,
           reason: 'persisted',
           ownerHandle,
+          requestedOwnerHandle: requestedOwnerDiffers ? requestedOwnerHandle : undefined,
           actorHandle: identity.handle,
+          attributionMode: report.attribution.mode,
+          attributionStrict: report.attribution.strict,
+          canonicalOwnerResolved,
         };
       }
     }
@@ -1163,8 +1398,13 @@ app.post('/api/refresh/seeds', async (c) => {
       retentionCleanup: execution.retention,
       cacheInvalidation: {
         localCachePurged: true,
-        cacheVersion: execution.refresh.runId,
+        cacheVersion: execution.cacheVersion ?? createPublicCacheVersionToken(execution.refresh.runId, execution.refresh.runId),
         edgeStrategy: 'Cache key versioning + short edge TTL',
+        expectedMaxVersionStalenessSeconds: Math.ceil(PUBLIC_CACHE_VERSION_TTL_MS / 1000),
+      },
+      lock: {
+        ttlSeconds: execution.lock.ttlSeconds,
+        heartbeatMs: execution.lock.heartbeatMs,
       },
       productionReady: true,
       placeholder: false,
@@ -1178,6 +1418,19 @@ app.post('/api/refresh/seeds', async (c) => {
           lock: {
             owner: error.lockOwner,
             expiresAt: error.expiresAt,
+          },
+        },
+        409,
+      );
+    }
+    if (error instanceof RefreshLockLostError) {
+      return c.json(
+        {
+          error: 'Refresh lock lost during execution',
+          actionable: 'Retry refresh now; heartbeat renewal indicates a competing run may have taken over.',
+          lock: {
+            owner: error.ownerId,
+            reason: error.reason,
           },
         },
         409,
@@ -1358,6 +1611,12 @@ const worker: ExportedHandler<WorkerBindings> = {
         .catch((error) => {
           if (error instanceof RefreshLockConflictError) {
             console.log(`[refresh] scheduled seed refresh skipped; lock held by ${error.lockOwner ?? 'unknown'}`);
+            return;
+          }
+          if (error instanceof RefreshLockLostError) {
+            console.warn(
+              `[refresh] scheduled seed refresh lock lost for owner=${error.ownerId}; reason=${error.reason}`,
+            );
             return;
           }
           const message = error instanceof Error ? error.message : String(error);

@@ -47,7 +47,7 @@ body {
   }
 
   .auth-cta {
-    @apply rounded-md border border-slate-600 px-2.5 py-1.5 font-mono text-[11px] uppercase tracking-[0.08em] text-ink-2 transition;
+    @apply inline-flex min-h-11 min-w-11 items-center justify-center rounded-md border border-slate-600 px-3 py-2 font-mono text-[11px] uppercase tracking-[0.08em] text-ink-2 transition;
     @apply hover:border-cyan-400 hover:text-ink-1 disabled:cursor-not-allowed disabled:opacity-60;
   }
 }

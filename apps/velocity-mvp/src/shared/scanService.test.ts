@@ -5,12 +5,14 @@ import type { GitHubCommit, GitHubPullRequest } from './types';
 vi.mock('./github', () => ({
   fetchCommitsForWindow: vi.fn(),
   fetchMergedPrsForWindow: vi.fn(),
+  resolveCanonicalRepoIdentity: vi.fn(),
 }));
 
-import { fetchCommitsForWindow, fetchMergedPrsForWindow } from './github';
+import { fetchCommitsForWindow, fetchMergedPrsForWindow, resolveCanonicalRepoIdentity } from './github';
 
 const fetchCommitsForWindowMock = vi.mocked(fetchCommitsForWindow);
 const fetchMergedPrsForWindowMock = vi.mocked(fetchMergedPrsForWindow);
+const resolveCanonicalRepoIdentityMock = vi.mocked(resolveCanonicalRepoIdentity);
 
 function commitFixture(sha: string, isoDate: string): GitHubCommit {
   return {
@@ -65,11 +67,35 @@ function mergedResultFixture(input: {
   };
 }
 
+function commitResultFixture(input: { commits?: GitHubCommit[]; truncated?: boolean }) {
+  const commits = input.commits ?? [];
+  const truncated = input.truncated ?? false;
+  return {
+    commits,
+    ingestion: {
+      pagesFetched: truncated ? 10 : 1,
+      maxPages: 10,
+      truncated,
+      coverage: truncated ? ('window-truncated' as const) : ('window-complete' as const),
+      confidence: truncated ? ('medium' as const) : ('high' as const),
+    },
+  };
+}
+
 describe('scanService attribution/window edges', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     fetchCommitsForWindowMock.mockReset();
     fetchMergedPrsForWindowMock.mockReset();
+    resolveCanonicalRepoIdentityMock.mockReset();
+    resolveCanonicalRepoIdentityMock.mockResolvedValue({
+      requestedOwner: 'acme',
+      requestedRepo: 'repo',
+      canonicalOwner: 'acme',
+      canonicalRepo: 'repo',
+      canonicalUrl: 'https://github.com/acme/repo',
+      canonicalOwnerResolved: true,
+    });
   });
 
   afterEach(() => {
@@ -80,7 +106,7 @@ describe('scanService attribution/window edges', () => {
     const frozenNow = new Date('2026-03-15T12:34:56.789Z');
     vi.setSystemTime(frozenNow);
 
-    fetchCommitsForWindowMock.mockResolvedValue([]);
+    fetchCommitsForWindowMock.mockResolvedValue(commitResultFixture({}));
     fetchMergedPrsForWindowMock.mockResolvedValue(mergedResultFixture({}));
 
     await scanRepoByUrl('https://github.com/acme/repo', undefined, {
@@ -131,7 +157,7 @@ describe('scanService attribution/window edges', () => {
   it('falls back to repo-wide attribution when handle-authored mode has an invalid handle', async () => {
     vi.setSystemTime(new Date('2026-03-15T12:34:56.789Z'));
 
-    fetchCommitsForWindowMock.mockResolvedValue([]);
+    fetchCommitsForWindowMock.mockResolvedValue(commitResultFixture({}));
     fetchMergedPrsForWindowMock.mockResolvedValue(mergedResultFixture({}));
 
     const report = await scanRepoByUrl('https://github.com/acme/repo', undefined, {
@@ -177,7 +203,9 @@ describe('scanService attribution/window edges', () => {
       prFixture(index + 1000, `2026-02-${String((index % 14) + 1).padStart(2, '0')}T12:00:00.000Z`),
     );
 
-    fetchCommitsForWindowMock.mockResolvedValueOnce(currentCommits).mockResolvedValueOnce(previousCommits);
+    fetchCommitsForWindowMock
+      .mockResolvedValueOnce(commitResultFixture({ commits: currentCommits, truncated: true }))
+      .mockResolvedValueOnce(commitResultFixture({ commits: previousCommits }));
     fetchMergedPrsForWindowMock
       .mockResolvedValueOnce(
         mergedResultFixture({
@@ -207,5 +235,44 @@ describe('scanService attribution/window edges', () => {
     expect(report.windows[0]?.throughputHeatmap).toHaveLength(7);
     expect(report.windows[0]?.throughputHeatmap?.[0]).toHaveLength(24);
     expect(report.assumptions.defaultBranchScope).toContain('main/master');
+    expect(report.metadata?.commitIngestion.current30d.truncated).toBe(true);
+    expect(report.metadata?.commitIngestion.current30d.confidence).toBe('medium');
+    expect(report.metadata?.repoIdentity.canonicalOwnerResolved).toBe(true);
+  });
+
+  it('uses canonical GitHub repository identity for owner/name and authorization metadata', async () => {
+    vi.setSystemTime(new Date('2026-03-15T12:34:56.789Z'));
+    resolveCanonicalRepoIdentityMock.mockResolvedValueOnce({
+      requestedOwner: 'legacy-org',
+      requestedRepo: 'old-repo',
+      canonicalOwner: 'new-org',
+      canonicalRepo: 'renamed-repo',
+      canonicalUrl: 'https://github.com/new-org/renamed-repo',
+      canonicalOwnerResolved: true,
+    });
+    fetchCommitsForWindowMock.mockResolvedValue(commitResultFixture({}));
+    fetchMergedPrsForWindowMock.mockResolvedValue(mergedResultFixture({}));
+
+    const report = await scanRepoByUrl('https://github.com/legacy-org/old-repo');
+
+    expect(report.repo).toEqual({
+      owner: 'new-org',
+      name: 'renamed-repo',
+      url: 'https://github.com/new-org/renamed-repo',
+    });
+    expect(report.metadata?.repoIdentity).toMatchObject({
+      requestedOwner: 'legacy-org',
+      requestedRepo: 'old-repo',
+      canonicalOwner: 'new-org',
+      canonicalRepo: 'renamed-repo',
+      canonicalOwnerResolved: true,
+    });
+    expect(fetchCommitsForWindowMock).toHaveBeenCalledWith(
+      { owner: 'new-org', repo: 'renamed-repo' },
+      expect.any(String),
+      expect.any(String),
+      undefined,
+      undefined,
+    );
   });
 });

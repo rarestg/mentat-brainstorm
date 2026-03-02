@@ -47,6 +47,7 @@ const PROFILE_ROTATING_INSIGHTS_LIMIT = 4;
 const THROUGHPUT_HEATMAP_SOURCE = 'd1:scans.windows_json.current30d.throughputHeatmap';
 const TREND_POINTS_SOURCE = 'd1:profile_metrics_history';
 const ROTATING_INSIGHTS_SOURCE = 'derived:d1:leaderboard_rows+d1:profile_metrics_history';
+const THIRTY_DAY_SOURCE = 'd1:snapshots.current30d.latest-per-repo';
 
 function createEmptyHeatmapCounts(): number[][] {
   return Array.from({ length: HEATMAP_DAYS }, () => Array.from({ length: HEATMAP_HOURS }, () => 0));
@@ -434,7 +435,7 @@ function buildProfileProvenance(params: {
 }): LeaderboardEntryProvenance {
   return {
     totals: authoritativeProvenance('d1:leaderboard_rows', params.totalsCapturedAt),
-    thirtyDay: authoritativeProvenance('d1:snapshots.current30d.aggregate', params.totalsCapturedAt),
+    thirtyDay: authoritativeProvenance(THIRTY_DAY_SOURCE, params.totalsCapturedAt),
     profile: {
       trendPoints: params.trendPayload.trendPoints
         ? authoritativeProvenance(TREND_POINTS_SOURCE, params.trendPayload.capturedAt)
@@ -1000,14 +1001,32 @@ export async function persistLeaderboardArtifact(
     return;
   }
 
-  if (persistedUserIds.length === 0) {
-    await db.prepare('DELETE FROM leaderboard_rows').run();
-    return;
-  }
-
   const placeholders = persistedUserIds.map(() => '?').join(', ');
+  const staleSeedFilter =
+    persistedUserIds.length > 0
+      ? `lr.user_id NOT IN (${placeholders}) AND`
+      : '';
   await db
-    .prepare(`DELETE FROM leaderboard_rows WHERE user_id NOT IN (${placeholders})`)
+    .prepare(
+      `DELETE FROM leaderboard_rows
+       WHERE user_id IN (
+         SELECT lr.user_id
+         FROM leaderboard_rows lr
+         WHERE ${staleSeedFilter}
+           EXISTS (
+             SELECT 1
+             FROM repo_ownership ro
+             WHERE ro.user_id = lr.user_id
+               AND ro.ownership_source LIKE 'seed-%'
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM repo_ownership ro
+             WHERE ro.user_id = lr.user_id
+               AND ro.ownership_source NOT LIKE 'seed-%'
+           )
+       )`,
+    )
     .bind(...persistedUserIds)
     .run();
 
@@ -1242,6 +1261,110 @@ async function markRefreshRunFailure(db: D1Database, runId: number, errorMessage
     .run();
 }
 
+interface LeaderboardRowSnapshot {
+  user_id: number;
+  rank: number;
+  scanned_repos: number;
+  featured_repo: string | null;
+  ai_ready_score: number | null;
+  scan_insight: string | null;
+  total_equivalent_engineering_hours: number;
+  total_merged_prs_unverified: number;
+  total_merged_prs_ci_verified: number;
+  total_merged_prs: number;
+  total_commits_per_day: number;
+  total_active_coding_hours: number;
+  total_off_hours_ratio: number;
+  total_velocity_acceleration: number;
+  attribution_mode: string;
+  attribution_source: string;
+  attribution_target_handle: string | null;
+  attribution_strict: number;
+  updated_at: string;
+}
+
+async function snapshotLeaderboardRows(db: D1Database): Promise<LeaderboardRowSnapshot[]> {
+  const result = await db
+    .prepare(
+      `SELECT
+         user_id,
+         rank,
+         scanned_repos,
+         featured_repo,
+         ai_ready_score,
+         scan_insight,
+         total_equivalent_engineering_hours,
+         total_merged_prs_unverified,
+         total_merged_prs_ci_verified,
+         total_merged_prs,
+         total_commits_per_day,
+         total_active_coding_hours,
+         total_off_hours_ratio,
+         total_velocity_acceleration,
+         attribution_mode,
+         attribution_source,
+         attribution_target_handle,
+         attribution_strict,
+         updated_at
+       FROM leaderboard_rows`,
+    )
+    .all<LeaderboardRowSnapshot>();
+
+  return result.results ?? [];
+}
+
+async function restoreLeaderboardRows(db: D1Database, snapshot: LeaderboardRowSnapshot[]): Promise<void> {
+  await db.prepare('DELETE FROM leaderboard_rows').run();
+  for (const row of snapshot) {
+    await db
+      .prepare(
+        `INSERT INTO leaderboard_rows (
+           user_id,
+           rank,
+           scanned_repos,
+           featured_repo,
+           ai_ready_score,
+           scan_insight,
+           total_equivalent_engineering_hours,
+           total_merged_prs_unverified,
+           total_merged_prs_ci_verified,
+           total_merged_prs,
+           total_commits_per_day,
+           total_active_coding_hours,
+           total_off_hours_ratio,
+           total_velocity_acceleration,
+           attribution_mode,
+           attribution_source,
+           attribution_target_handle,
+           attribution_strict,
+           updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(
+        row.user_id,
+        row.rank,
+        row.scanned_repos,
+        row.featured_repo,
+        row.ai_ready_score,
+        row.scan_insight,
+        row.total_equivalent_engineering_hours,
+        row.total_merged_prs_unverified,
+        row.total_merged_prs_ci_verified,
+        row.total_merged_prs,
+        row.total_commits_per_day,
+        row.total_active_coding_hours,
+        row.total_off_hours_ratio,
+        row.total_velocity_acceleration,
+        row.attribution_mode,
+        row.attribution_source,
+        row.attribution_target_handle,
+        row.attribution_strict,
+        row.updated_at,
+      )
+      .run();
+  }
+}
+
 export async function refreshLeaderboardFromSeed(
   db: D1Database,
   seed: SeedCreator[],
@@ -1250,9 +1373,12 @@ export async function refreshLeaderboardFromSeed(
 ): Promise<RefreshSeedResult> {
   const sourceSeedPath = 'data/seed-creators.json';
   const { runId } = await startRefreshRun(db, trigger, sourceSeedPath);
+  const leaderboardBeforeRefresh = await snapshotLeaderboardRows(db);
+  let persistenceAttempted = false;
 
   try {
     const artifact = await buildLeaderboard(seed, token);
+    persistenceAttempted = true;
     await persistLeaderboardArtifact(db, artifact, {
       refreshRunId: runId,
       ownershipSource: `seed-refresh:${trigger}`,
@@ -1268,6 +1394,17 @@ export async function refreshLeaderboardFromSeed(
       trigger,
     };
   } catch (error) {
+    if (persistenceAttempted) {
+      try {
+        await restoreLeaderboardRows(db, leaderboardBeforeRefresh);
+        await db.prepare('DELETE FROM profile_metrics_history WHERE refresh_run_id = ?').bind(runId).run();
+      } catch (restoreError) {
+        const restoreMessage = restoreError instanceof Error ? restoreError.message : String(restoreError);
+        const originalMessage = error instanceof Error ? error.message : String(error);
+        await markRefreshRunFailure(db, runId, `${originalMessage} | rollback-failed: ${restoreMessage}`);
+        throw error;
+      }
+    }
     const message = error instanceof Error ? error.message : 'Unknown seed refresh failure';
     await markRefreshRunFailure(db, runId, message);
     throw error;
@@ -1410,15 +1547,30 @@ export async function getLeaderboardArtifact(db: D1Database): Promise<Leaderboar
       INNER JOIN users u ON u.id = lr.user_id
       LEFT JOIN (
         SELECT
-          user_id,
-          SUM(equivalent_engineering_hours) AS equivalent_engineering_hours,
-          SUM(merged_prs) AS merged_prs,
-          AVG(commits_per_day) AS commits_per_day,
-          AVG(active_coding_hours) AS active_coding_hours
-        FROM snapshots
-        WHERE snapshot_type = 'scan'
-          AND datetime(scanned_at) >= datetime('now', '-30 day')
-        GROUP BY user_id
+          latest.user_id,
+          SUM(latest.equivalent_engineering_hours) AS equivalent_engineering_hours,
+          SUM(latest.merged_prs) AS merged_prs,
+          AVG(latest.commits_per_day) AS commits_per_day,
+          AVG(latest.active_coding_hours) AS active_coding_hours
+        FROM (
+          SELECT
+            s.user_id,
+            s.repo_id,
+            s.equivalent_engineering_hours,
+            s.merged_prs,
+            s.commits_per_day,
+            s.active_coding_hours,
+            ROW_NUMBER() OVER (
+              PARTITION BY s.user_id, s.repo_id
+              ORDER BY datetime(s.scanned_at) DESC, s.id DESC
+            ) AS repo_rank
+          FROM snapshots s
+          WHERE s.snapshot_type = 'scan'
+            AND s.repo_id IS NOT NULL
+            AND datetime(s.scanned_at) >= datetime('now', '-30 day')
+        ) latest
+        WHERE latest.repo_rank = 1
+        GROUP BY latest.user_id
       ) t30 ON t30.user_id = lr.user_id
       ORDER BY lr.rank ASC, lr.total_equivalent_engineering_hours DESC`,
     )
@@ -1539,15 +1691,30 @@ export async function getProfileByHandle(db: D1Database, handle: string): Promis
       INNER JOIN leaderboard_rows lr ON lr.user_id = u.id
       LEFT JOIN (
         SELECT
-          user_id,
-          SUM(equivalent_engineering_hours) AS equivalent_engineering_hours,
-          SUM(merged_prs) AS merged_prs,
-          AVG(commits_per_day) AS commits_per_day,
-          AVG(active_coding_hours) AS active_coding_hours
-        FROM snapshots
-        WHERE snapshot_type = 'scan'
-          AND datetime(scanned_at) >= datetime('now', '-30 day')
-        GROUP BY user_id
+          latest.user_id,
+          SUM(latest.equivalent_engineering_hours) AS equivalent_engineering_hours,
+          SUM(latest.merged_prs) AS merged_prs,
+          AVG(latest.commits_per_day) AS commits_per_day,
+          AVG(latest.active_coding_hours) AS active_coding_hours
+        FROM (
+          SELECT
+            s.user_id,
+            s.repo_id,
+            s.equivalent_engineering_hours,
+            s.merged_prs,
+            s.commits_per_day,
+            s.active_coding_hours,
+            ROW_NUMBER() OVER (
+              PARTITION BY s.user_id, s.repo_id
+              ORDER BY datetime(s.scanned_at) DESC, s.id DESC
+            ) AS repo_rank
+          FROM snapshots s
+          WHERE s.snapshot_type = 'scan'
+            AND s.repo_id IS NOT NULL
+            AND datetime(s.scanned_at) >= datetime('now', '-30 day')
+        ) latest
+        WHERE latest.repo_rank = 1
+        GROUP BY latest.user_id
       ) t30 ON t30.user_id = u.id
       WHERE lower(u.handle) = ?
       LIMIT 1`,

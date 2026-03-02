@@ -545,7 +545,7 @@ describe('fetchMergedPrsForWindow', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    const commits = await fetchCommitsForWindow(
+    const commitsResult = await fetchCommitsForWindow(
       { owner: 'acme', repo: 'strict-attribution' },
       '2026-01-01T00:00:00.000Z',
       '2026-02-01T00:00:00.000Z',
@@ -560,8 +560,96 @@ describe('fetchMergedPrsForWindow', () => {
       { authoredByHandle: 'alice' },
     );
 
-    expect(commits.map((commit) => commit.sha)).toEqual(['sha-alice']);
+    expect(commitsResult.commits.map((commit) => commit.sha)).toEqual(['sha-alice']);
+    expect(commitsResult.ingestion).toEqual({
+      pagesFetched: 1,
+      maxPages: 10,
+      truncated: false,
+      coverage: 'window-complete',
+      confidence: 'high',
+    });
     expect(prs.mergedPrs.map((pr) => pr.id)).toEqual([21]);
     expect(prs.ciVerifiedMergedPrs.map((pr) => pr.id)).toEqual([21]);
+  });
+});
+
+describe('fetchCommitsForWindow', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('returns commit ingestion metadata with full-window confidence when pagination completes early', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/repos/acme/commit-ingestion/commits?')) {
+        return createJsonResponse([
+          {
+            sha: 'sha-1',
+            parents: [{ sha: 'parent-1' }],
+            author: { login: 'alice', type: 'User' },
+            commit: {
+              author: { name: 'alice', date: '2026-01-15T00:00:00.000Z' },
+              committer: { name: 'alice', date: '2026-01-15T00:00:00.000Z' },
+            },
+          },
+        ]);
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await fetchCommitsForWindow(
+      { owner: 'acme', repo: 'commit-ingestion' },
+      '2026-01-01T00:00:00.000Z',
+      '2026-02-01T00:00:00.000Z',
+    );
+
+    expect(result.commits.map((commit) => commit.sha)).toEqual(['sha-1']);
+    expect(result.ingestion).toEqual({
+      pagesFetched: 1,
+      maxPages: 10,
+      truncated: false,
+      coverage: 'window-complete',
+      confidence: 'high',
+    });
+  });
+
+  it('marks commit ingestion as truncated when max page cap is exhausted', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/repos/acme/commit-page-cap/commits?')) {
+        const page = Number(new URL(url).searchParams.get('page') ?? '1');
+        const payload = Array.from({ length: 100 }, (_, index) => {
+          const commitNumber = (page - 1) * 100 + index + 1;
+          return {
+            sha: `sha-${commitNumber}`,
+            parents: [{ sha: `parent-${commitNumber}` }],
+            author: { login: 'alice', type: 'User' },
+            commit: {
+              author: { name: 'alice', date: '2026-01-15T00:00:00.000Z' },
+              committer: { name: 'alice', date: '2026-01-15T00:00:00.000Z' },
+            },
+          };
+        });
+        return createJsonResponse(payload);
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await fetchCommitsForWindow(
+      { owner: 'acme', repo: 'commit-page-cap' },
+      '2026-01-01T00:00:00.000Z',
+      '2026-02-01T00:00:00.000Z',
+    );
+
+    expect(result.commits).toHaveLength(1000);
+    expect(result.ingestion).toEqual({
+      pagesFetched: 10,
+      maxPages: 10,
+      truncated: true,
+      coverage: 'window-truncated',
+      confidence: 'medium',
+    });
   });
 });

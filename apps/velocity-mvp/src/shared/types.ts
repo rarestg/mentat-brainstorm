@@ -40,6 +40,30 @@ export interface RepoReportCard {
     ciVerification: string;
   };
   metadata?: {
+    repoIdentity: {
+      requestedOwner: string;
+      requestedRepo: string;
+      canonicalOwner: string;
+      canonicalRepo: string;
+      canonicalUrl: string;
+      canonicalOwnerResolved: boolean;
+    };
+    commitIngestion: {
+      current30d: {
+        pagesFetched: number;
+        maxPages: number;
+        truncated: boolean;
+        coverage: 'window-complete' | 'window-truncated';
+        confidence: 'high' | 'medium';
+      };
+      previous30d: {
+        pagesFetched: number;
+        maxPages: number;
+        truncated: boolean;
+        coverage: 'window-complete' | 'window-truncated';
+        confidence: 'high' | 'medium';
+      };
+    };
     mergedPrIngestion: {
       current30d: {
         pagesFetched: number;
@@ -73,9 +97,20 @@ export interface RepoReportCard {
   };
   persistence?: {
     canonicalLeaderboardWrite: boolean;
-    reason: 'db-unavailable' | 'unauthenticated' | 'owner-mismatch' | 'persisted';
+    rankingEligible: boolean;
+    reason:
+      | 'db-unavailable'
+      | 'unauthenticated'
+      | 'owner-mismatch'
+      | 'owner-unresolved'
+      | 'non-canonical-attribution'
+      | 'persisted';
     ownerHandle: string;
+    requestedOwnerHandle?: string;
     actorHandle?: string;
+    attributionMode: AttributionMode;
+    attributionStrict: boolean;
+    canonicalOwnerResolved: boolean;
   };
   metrics: VelocityMetrics;
   windows: ScanWindowSummary[];
@@ -204,12 +239,27 @@ export interface ProfileCrown {
   awardedAt: string;
 }
 
+export type RivalryProgressionSource = 'server' | 'history-derived';
+export type RivalryProgressionTrend = 'closing' | 'widening' | 'stable';
+
+export interface ProfileRivalryProgression {
+  rivalHandle: string;
+  source: RivalryProgressionSource;
+  capturedAt: string;
+  trend: RivalryProgressionTrend;
+  rankDelta: number;
+  equivalentEngineeringHoursDelta: number;
+  currentGapEquivalentEngineeringHours: number;
+  currentGapRank: number;
+}
+
 export interface ProfileResponse {
   handle: string;
   stackTier: OperatingStackTier;
   crowns: ProfileCrown[];
   leaderboard: LeaderboardEntry;
   history: ProfileMetricsHistoryPoint[];
+  rivalry?: ProfileRivalryProgression;
 }
 
 export interface GitHubCommit {

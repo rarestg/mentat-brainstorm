@@ -12,8 +12,37 @@ const CI_VERIFICATION_CONCURRENCY = 4;
 const CI_VERIFICATION_SOFT_CAP_MID = 150;
 const CI_VERIFICATION_SOFT_CAP_HIGH = 250;
 
-interface GitHubBranchMetadata {
+interface GitHubRepositoryMetadata {
+  name?: string;
+  html_url?: string;
   default_branch?: string;
+  owner?: {
+    login?: string;
+  };
+}
+
+export interface CanonicalRepoIdentity {
+  requestedOwner: string;
+  requestedRepo: string;
+  canonicalOwner: string;
+  canonicalRepo: string;
+  canonicalUrl: string;
+  canonicalOwnerResolved: boolean;
+}
+
+export type CommitIngestionConfidence = 'high' | 'medium';
+
+export interface CommitIngestionMetadata {
+  pagesFetched: number;
+  maxPages: number;
+  truncated: boolean;
+  coverage: 'window-complete' | 'window-truncated';
+  confidence: CommitIngestionConfidence;
+}
+
+export interface FetchCommitsResult {
+  commits: GitHubCommit[];
+  ingestion: CommitIngestionMetadata;
 }
 
 interface GitHubCheckRun {
@@ -89,6 +118,19 @@ function authoredByTarget(login: string | undefined, options?: AttributionOption
     return true;
   }
   return normalizeHandle(login) === target;
+}
+
+function toCanonicalOwner(value: string | undefined, fallback: string): string {
+  return normalizeHandle(value) ?? normalizeHandle(fallback) ?? fallback.trim().toLowerCase();
+}
+
+function toCanonicalRepo(value: string | undefined, fallback: string): string {
+  const normalized = value?.trim();
+  return normalized && normalized.length > 0 ? normalized : fallback;
+}
+
+async function fetchRepositoryMetadata(ref: RepoRef, token?: string): Promise<GitHubRepositoryMetadata> {
+  return ghGet<GitHubRepositoryMetadata>(`${GITHUB_API}/repos/${ref.owner}/${ref.repo}`, token);
 }
 
 async function ghGet<T>(url: string, token?: string): Promise<T> {
@@ -173,7 +215,7 @@ async function resolveDefaultBranchTargets(ref: RepoRef, token?: string): Promis
   usedFallback: boolean;
 }> {
   try {
-    const metadata = await ghGet<GitHubBranchMetadata>(`${GITHUB_API}/repos/${ref.owner}/${ref.repo}`, token);
+    const metadata = await fetchRepositoryMetadata(ref, token);
     const defaultBranch = metadata.default_branch?.trim();
     if (defaultBranch) {
       return { branchTargets: new Set([defaultBranch]), usedFallback: false };
@@ -183,6 +225,33 @@ async function resolveDefaultBranchTargets(ref: RepoRef, token?: string): Promis
   }
 
   return { branchTargets: new Set(['main', 'master']), usedFallback: true };
+}
+
+export async function resolveCanonicalRepoIdentity(ref: RepoRef, token?: string): Promise<CanonicalRepoIdentity> {
+  const requestedOwner = toCanonicalOwner(ref.owner, ref.owner);
+  const requestedRepo = toCanonicalRepo(ref.repo, ref.repo);
+  try {
+    const metadata = await fetchRepositoryMetadata(ref, token);
+    const canonicalOwner = toCanonicalOwner(metadata.owner?.login, ref.owner);
+    const canonicalRepo = toCanonicalRepo(metadata.name, ref.repo);
+    return {
+      requestedOwner,
+      requestedRepo,
+      canonicalOwner,
+      canonicalRepo,
+      canonicalUrl: metadata.html_url?.trim() || `https://github.com/${canonicalOwner}/${canonicalRepo}`,
+      canonicalOwnerResolved: true,
+    };
+  } catch {
+    return {
+      requestedOwner,
+      requestedRepo,
+      canonicalOwner: requestedOwner,
+      canonicalRepo: requestedRepo,
+      canonicalUrl: `https://github.com/${requestedOwner}/${requestedRepo}`,
+      canonicalOwnerResolved: false,
+    };
+  }
 }
 
 async function isMergeCommitCiVerified(ref: RepoRef, mergeCommitSha: string, token?: string): Promise<boolean> {
@@ -346,12 +415,15 @@ export async function fetchCommitsForWindow(
   until: string,
   token?: string,
   options?: AttributionOptions,
-): Promise<GitHubCommit[]> {
+): Promise<FetchCommitsResult> {
   const all: GitHubCommit[] = [];
+  let pagesFetched = 0;
+  let truncated = false;
 
   for (let page = 1; page <= MAX_COMMIT_PAGES; page += 1) {
     const url = `${GITHUB_API}/repos/${ref.owner}/${ref.repo}/commits?since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}&per_page=100&page=${page}`;
     const pageData = await ghGet<GitHubCommit[]>(url, token);
+    pagesFetched = page;
     if (pageData.length === 0) {
       break;
     }
@@ -359,6 +431,10 @@ export async function fetchCommitsForWindow(
 
     if (pageData.length < 100) {
       break;
+    }
+
+    if (page === MAX_COMMIT_PAGES) {
+      truncated = true;
     }
   }
 
@@ -380,7 +456,16 @@ export async function fetchCommitsForWindow(
     deduped.set(commit.sha, commit);
   }
 
-  return [...deduped.values()];
+  return {
+    commits: [...deduped.values()],
+    ingestion: {
+      pagesFetched,
+      maxPages: MAX_COMMIT_PAGES,
+      truncated,
+      coverage: truncated ? 'window-truncated' : 'window-complete',
+      confidence: truncated ? 'medium' : 'high',
+    },
+  };
 }
 
 export async function fetchMergedPrsForWindow(

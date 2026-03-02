@@ -32,6 +32,7 @@ Validation snapshot timestamp: `2026-02-28T07:56:47Z`.
 Migrations applied in codebase:
 - `migrations/0001_velocity_schema.sql`
 - `migrations/0002_auth_identity_refresh.sql`
+- `migrations/0003_leaderboard_rank_constraints.sql`
 
 Tables:
 - `users`
@@ -47,12 +48,18 @@ Tables:
 - `refresh_runs`
 
 `0002` also adds attribution columns used in snapshots/leaderboard/history flows.
+`0003` enforces `leaderboard_rows.rank > 0` and normalizes rank order on migration apply.
 
 ## Cloudflare Runtime Configuration
 `wrangler.toml` contains:
 - `staging` and `production` environments
 - D1 bindings per environment
 - Daily cron trigger at `03:17 UTC` (`17 3 * * *`) for both staging and production
+
+Release script order is now enforced as:
+- `deploy:dev` -> `d1:migrate:development` then `deploy:dev:worker`
+- `deploy:staging` -> `d1:migrate:staging` then `deploy:staging:worker`
+- `deploy:production` -> `d1:migrate:production` then `deploy:production:worker`
 
 ## Local Validation
 Run from `apps/velocity-mvp`:

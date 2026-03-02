@@ -14,20 +14,32 @@ import { getLeaderboardArtifact, persistLeaderboardArtifact, persistScanReport, 
 const buildLeaderboardMock = vi.mocked(buildLeaderboard);
 
 function splitSqlStatements(sql: string): string[] {
-  return sql
-    .replace(/^PRAGMA\s+[^;]+;\s*$/gim, '')
+  const withoutPragmas = sql.replace(/^PRAGMA\s+[^;]+;\s*$/gim, '');
+  const triggerPattern = /CREATE\s+TRIGGER[\s\S]*?END;/gim;
+  const triggerStatements = Array.from(withoutPragmas.matchAll(triggerPattern)).map(([statement]) => statement);
+
+  const baseStatements = withoutPragmas
+    .replace(triggerPattern, '')
     .split(';')
     .map((statement) => statement.replace(/\s+/g, ' ').trim())
     .filter((statement) => statement.length > 0)
     .map((statement) => `${statement};`);
+
+  const normalizedTriggers = triggerStatements
+    .map((statement) => statement.replace(/\s+/g, ' ').trim())
+    .filter((statement) => statement.length > 0)
+    .map((statement) => (statement.endsWith(';') ? statement : `${statement};`));
+
+  return [...baseStatements, ...normalizedTriggers];
 }
 
 async function loadMigrationStatements(): Promise<string[]> {
-  const [schemaSql, authSql] = await Promise.all([
+  const [schemaSql, authSql, rankConstraintSql] = await Promise.all([
     readFile(new URL('../../../migrations/0001_velocity_schema.sql', import.meta.url), 'utf8'),
     readFile(new URL('../../../migrations/0002_auth_identity_refresh.sql', import.meta.url), 'utf8'),
+    readFile(new URL('../../../migrations/0003_leaderboard_rank_constraints.sql', import.meta.url), 'utf8'),
   ]);
-  return [...splitSqlStatements(schemaSql), ...splitSqlStatements(authSql)];
+  return [...splitSqlStatements(schemaSql), ...splitSqlStatements(authSql), ...splitSqlStatements(rankConstraintSql)];
 }
 
 async function applyMigrations(db: D1Database): Promise<void> {
@@ -92,6 +104,49 @@ function artifactFixture(entries: LeaderboardArtifact['entries']): LeaderboardAr
     generatedAt: '2026-02-28T12:00:00.000Z',
     sourceSeedPath: 'data/seed-creators.json',
     entries,
+  };
+}
+
+function seededEntryWithRepo(handle: string, equivalentEngineeringHours: number): LeaderboardArtifact['entries'][number] {
+  return {
+    rank: 1,
+    handle,
+    scannedRepos: 1,
+    attribution: {
+      mode: 'handle-authored',
+      source: 'github-author-login-match',
+      targetHandle: handle,
+      strict: true,
+      productionReady: true,
+      notes: 'strict',
+    },
+    totals: {
+      equivalentEngineeringHours,
+      mergedPrsUnverified: 9,
+      mergedPrsCiVerified: 8,
+      mergedPrs: 8,
+      commitsPerDay: 2.4,
+      activeCodingHours: 36,
+      offHoursRatio: 0.2,
+      velocityAcceleration: 0.2,
+    },
+    repos: [
+      reportFixture({
+        repo: {
+          owner: handle,
+          name: 'seed-repo',
+          url: `https://github.com/${handle}/seed-repo`,
+        },
+        attribution: {
+          mode: 'handle-authored',
+          source: 'github-author-login-match',
+          targetHandle: handle,
+          strict: true,
+          productionReady: true,
+          notes: 'strict',
+        },
+      }),
+    ],
   };
 }
 
@@ -301,6 +356,35 @@ describe('worker data integration (local D1)', () => {
     expect(artifact.entries.every((entry) => (entry.percentile ?? 0) >= 0 && (entry.percentile ?? 0) <= 100)).toBe(true);
   });
 
+  it('W2-018 guard: local integration harness enforces rank > 0 trigger from migration 0003', async () => {
+    await db.prepare('INSERT INTO users (handle) VALUES (?)').bind('rank-trigger-user').run();
+    const user = await db.prepare('SELECT id FROM users WHERE handle = ?').bind('rank-trigger-user').first<{ id: number }>();
+
+    await expect(
+      db
+        .prepare(
+          `INSERT INTO leaderboard_rows (
+             user_id,
+             rank,
+             scanned_repos,
+             featured_repo,
+             ai_ready_score,
+             scan_insight,
+             total_equivalent_engineering_hours,
+             total_merged_prs_unverified,
+             total_merged_prs_ci_verified,
+             total_merged_prs,
+             total_commits_per_day,
+             total_active_coding_hours,
+             total_off_hours_ratio,
+             total_velocity_acceleration
+           ) VALUES (?, 0, 1, NULL, NULL, NULL, 10, 1, 1, 1, 1, 1, 0.1, 0.1)`,
+        )
+        .bind(user?.id ?? -1)
+        .run(),
+    ).rejects.toThrow('leaderboard_rows.rank must be > 0');
+  });
+
   it('records refresh-run metadata and links profile history rows to refresh_run_id', async () => {
     buildLeaderboardMock.mockResolvedValue(
       artifactFixture([
@@ -452,5 +536,350 @@ describe('worker data integration (local D1)', () => {
       .first<{ total_equivalent_engineering_hours: number }>();
 
     expect(leaderboardRow?.total_equivalent_engineering_hours).toBe(210);
+  });
+
+  it('W2-001 guard: seed pruning keeps manual canonical entrants while removing stale seed-only rows', async () => {
+    await persistScanReport(
+      db,
+      reportFixture({
+        repo: {
+          owner: 'manual-user',
+          name: 'repo',
+          url: 'https://github.com/manual-user/repo',
+        },
+      }),
+    );
+
+    await persistLeaderboardArtifact(
+      db,
+      artifactFixture([
+        seededEntryWithRepo('seed-a', 90),
+        seededEntryWithRepo('seed-b', 80),
+      ]),
+      {
+        ownershipSource: 'seed-refresh:manual',
+        pruneRowsOutsideArtifact: true,
+      },
+    );
+
+    await persistLeaderboardArtifact(
+      db,
+      artifactFixture([seededEntryWithRepo('seed-a', 95)]),
+      {
+        ownershipSource: 'seed-refresh:manual',
+        pruneRowsOutsideArtifact: true,
+      },
+    );
+
+    const persistedRows = await db
+      .prepare(
+        `SELECT u.handle
+         FROM leaderboard_rows lr
+         INNER JOIN users u ON u.id = lr.user_id
+         ORDER BY lower(u.handle) ASC`,
+      )
+      .all<{ handle: string }>();
+    expect((persistedRows.results ?? []).map((row) => row.handle)).toEqual(['manual-user', 'seed-a']);
+  });
+
+  it('W2-019 guard: manual canonical entrants survive refresh even when not present in seed artifact', async () => {
+    await persistScanReport(
+      db,
+      reportFixture({
+        repo: {
+          owner: 'manual-user',
+          name: 'repo',
+          url: 'https://github.com/manual-user/repo',
+        },
+        metrics: {
+          commitsPerDay: 6.1,
+          mergedPrsUnverified: 16,
+          mergedPrsCiVerified: 14,
+          mergedPrs: 14,
+          activeCodingHours: 67,
+          offHoursRatio: 0.36,
+          velocityAcceleration: 0.57,
+          equivalentEngineeringHours: 166,
+        },
+      }),
+    );
+
+    buildLeaderboardMock.mockResolvedValue(
+      artifactFixture([
+        {
+          rank: 1,
+          handle: 'seeded',
+          scannedRepos: 1,
+          attribution: {
+            mode: 'handle-authored',
+            source: 'github-author-login-match',
+            targetHandle: 'seeded',
+            strict: true,
+            productionReady: true,
+            notes: 'strict',
+          },
+          totals: {
+            equivalentEngineeringHours: 99,
+            mergedPrsUnverified: 11,
+            mergedPrsCiVerified: 10,
+            mergedPrs: 10,
+            commitsPerDay: 2.9,
+            activeCodingHours: 41,
+            offHoursRatio: 0.2,
+            velocityAcceleration: 0.31,
+          },
+          repos: [],
+        },
+      ]),
+    );
+
+    await refreshLeaderboardFromSeed(db, [{ handle: 'seeded' }] as SeedCreator[], undefined, 'manual');
+
+    const persistedRows = await db
+      .prepare(
+        `SELECT u.handle, lr.total_equivalent_engineering_hours AS equivalent_engineering_hours
+         FROM leaderboard_rows lr
+         INNER JOIN users u ON u.id = lr.user_id
+         ORDER BY lower(u.handle) ASC`,
+      )
+      .all<{ handle: string; equivalent_engineering_hours: number }>();
+    const handles = (persistedRows.results ?? []).map((row) => row.handle);
+    const manualRow = (persistedRows.results ?? []).find((row) => row.handle === 'manual-user');
+
+    expect(handles).toContain('seeded');
+    expect(handles).toContain('manual-user');
+    expect(manualRow?.equivalent_engineering_hours).toBe(166);
+  });
+
+  it('W2-019 guard: failed seed refresh must not delete existing manual canonical rows', async () => {
+    await persistScanReport(
+      db,
+      reportFixture({
+        repo: {
+          owner: 'manual-user',
+          name: 'repo',
+          url: 'https://github.com/manual-user/repo',
+        },
+        metrics: {
+          commitsPerDay: 4.1,
+          mergedPrsUnverified: 9,
+          mergedPrsCiVerified: 8,
+          mergedPrs: 8,
+          activeCodingHours: 39,
+          offHoursRatio: 0.22,
+          velocityAcceleration: 0.2,
+          equivalentEngineeringHours: 88,
+        },
+      }),
+    );
+
+    buildLeaderboardMock.mockRejectedValueOnce(new Error('seed refresh exploded'));
+
+    await expect(refreshLeaderboardFromSeed(db, [{ handle: 'seeded' }] as SeedCreator[], undefined, 'manual')).rejects.toThrow(
+      'seed refresh exploded',
+    );
+
+    const manualRow = await db
+      .prepare(
+        `SELECT lr.total_equivalent_engineering_hours
+         FROM leaderboard_rows lr
+         INNER JOIN users u ON u.id = lr.user_id
+         WHERE u.handle = ?`,
+      )
+      .bind('manual-user')
+      .first<{ total_equivalent_engineering_hours: number }>();
+    const refreshRun = await db
+      .prepare('SELECT status, error_message FROM refresh_runs ORDER BY id DESC LIMIT 1')
+      .first<{ status: string; error_message: string | null }>();
+
+    expect(manualRow?.total_equivalent_engineering_hours).toBe(88);
+    expect(refreshRun?.status).toBe('failed');
+    expect(refreshRun?.error_message).toContain('seed refresh exploded');
+  });
+
+  it('W2-009 guard: refresh persistence rollback prevents partial canonical leaderboard state', async () => {
+    await persistLeaderboardArtifact(
+      db,
+      artifactFixture([
+        {
+          rank: 1,
+          handle: 'seeded',
+          scannedRepos: 1,
+          attribution: {
+            mode: 'handle-authored',
+            source: 'github-author-login-match',
+            targetHandle: 'seeded',
+            strict: true,
+            productionReady: true,
+            notes: 'strict',
+          },
+          totals: {
+            equivalentEngineeringHours: 77,
+            mergedPrsUnverified: 8,
+            mergedPrsCiVerified: 7,
+            mergedPrs: 7,
+            commitsPerDay: 2.1,
+            activeCodingHours: 31,
+            offHoursRatio: 0.19,
+            velocityAcceleration: 0.17,
+          },
+          repos: [],
+        },
+      ]),
+    );
+
+    buildLeaderboardMock.mockResolvedValue(
+      artifactFixture([
+        {
+          rank: 1,
+          handle: 'alice',
+          scannedRepos: 1,
+          attribution: {
+            mode: 'handle-authored',
+            source: 'github-author-login-match',
+            targetHandle: 'alice',
+            strict: true,
+            productionReady: true,
+            notes: 'strict',
+          },
+          totals: {
+            equivalentEngineeringHours: 88,
+            mergedPrsUnverified: 9,
+            mergedPrsCiVerified: 8,
+            mergedPrs: 8,
+            commitsPerDay: 2.4,
+            activeCodingHours: 34,
+            offHoursRatio: 0.2,
+            velocityAcceleration: 0.21,
+          },
+          repos: [],
+        },
+        {
+          rank: 2,
+          handle: undefined as unknown as string,
+          scannedRepos: 1,
+          attribution: {
+            mode: 'handle-authored',
+            source: 'github-author-login-match',
+            targetHandle: 'broken',
+            strict: true,
+            productionReady: true,
+            notes: 'strict',
+          },
+          totals: {
+            equivalentEngineeringHours: 12,
+            mergedPrsUnverified: 2,
+            mergedPrsCiVerified: 1,
+            mergedPrs: 1,
+            commitsPerDay: 0.5,
+            activeCodingHours: 8,
+            offHoursRatio: 0.1,
+            velocityAcceleration: 0.03,
+          },
+          repos: [],
+        },
+      ]),
+    );
+
+    await expect(refreshLeaderboardFromSeed(db, [{ handle: 'seeded' }] as SeedCreator[], undefined, 'manual')).rejects.toThrow();
+
+    const leaderboardRows = await db
+      .prepare(
+        `SELECT u.handle
+         FROM leaderboard_rows lr
+         INNER JOIN users u ON u.id = lr.user_id
+         ORDER BY lower(u.handle) ASC`,
+      )
+      .all<{ handle: string }>();
+    const historyCount = await db.prepare('SELECT COUNT(*) AS count FROM profile_metrics_history').first<{ count: number }>();
+    const refreshRun = await db
+      .prepare('SELECT status, entries_processed FROM refresh_runs ORDER BY id DESC LIMIT 1')
+      .first<{ status: string; entries_processed: number | null }>();
+
+    expect((leaderboardRows.results ?? []).map((row) => row.handle)).toEqual(['seeded']);
+    expect(Number(historyCount?.count ?? 0)).toBe(1);
+    expect(refreshRun?.status).toBe('failed');
+    expect(refreshRun?.entries_processed).toBeNull();
+  });
+
+  it('W2-012 guard: thirtyDay metrics use latest-per-repo semantics across repeat scans', async () => {
+    const dayMs = 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const daysAgoIso = (daysAgo: number) => new Date(now - daysAgo * dayMs).toISOString();
+
+    await persistScanReport(
+      db,
+      reportFixture({
+        repo: {
+          owner: 'alice',
+          name: 'repo-a',
+          url: 'https://github.com/alice/repo-a',
+        },
+        scannedAt: daysAgoIso(8),
+        metrics: {
+          commitsPerDay: 1.5,
+          mergedPrsUnverified: 2,
+          mergedPrsCiVerified: 2,
+          mergedPrs: 2,
+          activeCodingHours: 12,
+          offHoursRatio: 0.2,
+          velocityAcceleration: 0.1,
+          equivalentEngineeringHours: 20,
+        },
+      }),
+    );
+    await persistScanReport(
+      db,
+      reportFixture({
+        repo: {
+          owner: 'alice',
+          name: 'repo-a',
+          url: 'https://github.com/alice/repo-a',
+        },
+        scannedAt: daysAgoIso(2),
+        metrics: {
+          commitsPerDay: 3,
+          mergedPrsUnverified: 5,
+          mergedPrsCiVerified: 4,
+          mergedPrs: 4,
+          activeCodingHours: 20,
+          offHoursRatio: 0.25,
+          velocityAcceleration: 0.3,
+          equivalentEngineeringHours: 40,
+        },
+      }),
+    );
+    await persistScanReport(
+      db,
+      reportFixture({
+        repo: {
+          owner: 'alice',
+          name: 'repo-b',
+          url: 'https://github.com/alice/repo-b',
+        },
+        scannedAt: daysAgoIso(1),
+        metrics: {
+          commitsPerDay: 4,
+          mergedPrsUnverified: 6,
+          mergedPrsCiVerified: 5,
+          mergedPrs: 5,
+          activeCodingHours: 24,
+          offHoursRatio: 0.3,
+          velocityAcceleration: 0.35,
+          equivalentEngineeringHours: 60,
+        },
+      }),
+    );
+
+    const artifact = await getLeaderboardArtifact(db);
+    const alice = artifact.entries.find((entry) => entry.handle === 'alice');
+
+    expect(alice?.thirtyDay).toEqual({
+      equivalentEngineeringHours: 100,
+      mergedPrs: 9,
+      commitsPerDay: 3.5,
+      activeCodingHours: 22,
+    });
+    expect(alice?.provenance?.thirtyDay.source).toBe('d1:snapshots.current30d.latest-per-repo');
   });
 });
