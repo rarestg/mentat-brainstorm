@@ -1,7 +1,7 @@
 # Team: Product Loop
 
 Owner: Hegel
-Status: IN_PROGRESS
+Status: DONE
 
 ## Scope
 
@@ -41,9 +41,9 @@ Refs:
 - `apps/velocity-mvp/src/shared/leaderboard.ts:104`
 
 Acceptance Criteria:
-- [ ] Velocity profile/leaderboard exposes actionable Scan hook (not placeholder)
-- [ ] profile shows a concrete “next fix” action path where available
-- [ ] trust labels remain explicit for missing readiness data
+- [x] Velocity profile/leaderboard exposes actionable Scan hook (not placeholder)
+- [x] profile shows a concrete “next fix” action path where available
+- [x] trust labels remain explicit for missing readiness data
 
 ### W2-004 (High) Factory Floor payload is empty
 
@@ -56,15 +56,15 @@ Refs:
 - `apps/velocity-mvp/src/client/App.tsx:1104`
 
 Acceptance Criteria:
-- [ ] profile includes real repo-level cards for top repos
-- [ ] each card includes throughput + readiness/trust context + insight slot
-- [ ] empty-state only appears when no valid repo snapshots exist
+- [x] profile includes real repo-level cards for top repos
+- [x] each card includes throughput + readiness/trust context + insight slot
+- [x] empty-state only appears when no valid repo snapshots exist
 
 ## Checklist
 
 - [x] W2-002 fixed
-- [ ] W2-003 fixed
-- [ ] W2-004 fixed
+- [x] W2-003 fixed
+- [x] W2-004 fixed
 - [x] scenario validation evidence attached
 
 ## Dependencies / Requests
@@ -74,6 +74,21 @@ Acceptance Criteria:
 - QA Verification for compare-loop and profile-contract regression tests.
 
 ## Work Log
+
+Date: 2026-03-02
+Engineer: Program follow-up
+Tasks touched: W2-003, W2-004
+What changed:
+- Added actionable Velocity->Scan loop UX in `apps/velocity-mvp/src/client/App.tsx` with explicit scan CTAs from leaderboard rows and profile repo cards.
+- Wired backend repo-card payloads in `apps/velocity-mvp/src/worker/data/db.ts` via latest-per-repo snapshot reads and trust-context parsing.
+- Normalized legacy persisted placeholder scan insights at read time in `apps/velocity-mvp/src/worker/data/db.ts` to always return actionable next-fix guidance.
+Validation:
+- `npm run test -- src/client/App.route.test.ts src/worker/index.test.ts src/worker/data/db.test.ts src/worker/data/db.integration.test.ts` (pass)
+- `npm run typecheck` (pass)
+- staging deploy + smoke (`/api/health`, `/api/leaderboard`, `/api/scan`) pass at `https://velocity-mvp-staging.rarestg.workers.dev` with `LEGACY_PLACEHOLDER_PRESENT=false`
+- production deploy + smoke (`/api/health`, `/api/leaderboard`, `/api/scan`) pass at `https://velocity-mvp-production.rarestg.workers.dev` with `LEGACY_PLACEHOLDER_PRESENT=false`
+Open questions:
+- None.
 
 Date: 2026-03-02
 Engineer: Sagan (Product + Growth UX lane owner for W2-002 handoff)

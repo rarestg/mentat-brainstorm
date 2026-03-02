@@ -5,7 +5,7 @@ import type { LeaderboardArtifact, LeaderboardEntry, ProfileResponse, RepoReport
 
 type View = 'leaderboard' | 'scan';
 
-type Route =
+export type Route =
   | { kind: 'home' }
   | { kind: 'profile'; handle: string; challengeTargetHandle: string | null; hasInvalidChallengeQuery: boolean };
 
@@ -161,7 +161,7 @@ function normalizeHandle(handle: string): string | null {
   return normalized;
 }
 
-function buildChallengeLink(origin: string, challengerHandle: string, targetHandle: string): string | null {
+export function buildChallengeLink(origin: string, challengerHandle: string, targetHandle: string): string | null {
   const normalizedChallenger = normalizeHandle(challengerHandle);
   const normalizedTarget = normalizeHandle(targetHandle);
   if (!normalizedChallenger || !normalizedTarget) {
@@ -191,7 +191,7 @@ function formatRankDelta(previousRank: number, currentRank: number): string {
   return '0';
 }
 
-function parseChallengeQuery(search: string): { targetHandle: string | null; hasInvalidQuery: boolean } {
+export function parseChallengeQuery(search: string): { targetHandle: string | null; hasInvalidQuery: boolean } {
   const params = new URLSearchParams(search);
   const rawTarget = params.get('challenge');
   if (!rawTarget) {
@@ -204,7 +204,7 @@ function parseChallengeQuery(search: string): { targetHandle: string | null; has
   return { targetHandle: normalized, hasInvalidQuery: false };
 }
 
-function parseRoute(pathname: string, search: string): Route {
+export function parseRoute(pathname: string, search: string): Route {
   const profileMatch = pathname.match(/^\/v\/([A-Za-z0-9_.-]+)\/?$/);
   if (profileMatch) {
     const challengeQuery = parseChallengeQuery(search);
@@ -218,12 +218,88 @@ function parseRoute(pathname: string, search: string): Route {
   return { kind: 'home' };
 }
 
-function routeToPath(route: Route): string {
+export function routeToPath(route: Route): string {
   if (route.kind === 'profile') {
     const challengeQuery = route.challengeTargetHandle ? `?challenge=${encodeURIComponent(route.challengeTargetHandle)}` : '';
     return `/v/${route.handle}${challengeQuery}`;
   }
   return '/';
+}
+
+export type ChallengeDeepLinkResolution =
+  | 'none'
+  | 'invalid-query'
+  | 'challenger-missing'
+  | 'target-missing'
+  | 'self-target'
+  | 'compare-ready';
+
+export function resolveChallengeDeepLinkResolution(params: {
+  route: Route;
+  challengerHandle: string | null;
+  targetHandle: string | null;
+}): ChallengeDeepLinkResolution {
+  if (params.route.kind !== 'profile' || (!params.route.challengeTargetHandle && !params.route.hasInvalidChallengeQuery)) {
+    return 'none';
+  }
+  if (params.route.hasInvalidChallengeQuery) {
+    return 'invalid-query';
+  }
+  if (!params.challengerHandle) {
+    return 'challenger-missing';
+  }
+  if (!params.targetHandle) {
+    return 'target-missing';
+  }
+  if (params.targetHandle === params.challengerHandle) {
+    return 'self-target';
+  }
+  return 'compare-ready';
+}
+
+function buildScanActionRecommendation(entry: LeaderboardEntry): { headline: string; detail: string } {
+  if (entry.totals.mergedPrsUnverified > 0) {
+    const ciCoverage = entry.totals.mergedPrsCiVerified / Math.max(1, entry.totals.mergedPrsUnverified);
+    if (ciCoverage < 0.7) {
+      return {
+        headline: 'Increase CI verification coverage',
+        detail: `Only ${Math.round(ciCoverage * 100)}% of merged PRs are CI-verified. Start with flaky/default-branch checks on your featured repo.`,
+      };
+    }
+  }
+  if (entry.totals.offHoursRatio > 0.45) {
+    return {
+      headline: 'Reduce off-hours concentration',
+      detail: `Off-hours ratio is ${formatPercent(entry.totals.offHoursRatio)}. Shift merge windows toward core collaboration hours.`,
+    };
+  }
+  if (entry.totals.velocityAcceleration < 0) {
+    return {
+      headline: 'Recover velocity acceleration',
+      detail: 'Acceleration is negative in the latest window. Prioritize a weekly merge cadence on your highest-impact repo.',
+    };
+  }
+  if (entry.totals.commitsPerDay < 1.5) {
+    return {
+      headline: 'Increase daily commit cadence',
+      detail: 'Current commit cadence is low for this tier. Run a focused scan after your next active coding block.',
+    };
+  }
+  return {
+    headline: 'Run Mentat Scan to unlock next fix',
+    detail: 'Throughput looks stable. Trigger a fresh repo scan to surface AI-readiness actions and bottlenecks.',
+  };
+}
+
+function formatNextFixDetail(detail: string): string {
+  const trimmed = detail.trim();
+  if (!trimmed) {
+    return 'Next fix: run Mentat Scan to generate a concrete next step.';
+  }
+  if (/^next fix:/i.test(trimmed)) {
+    return trimmed;
+  }
+  return `Next fix: ${trimmed}`;
 }
 
 function getPercentile(entry: LeaderboardEntry, totalEntries: number): number {
@@ -651,6 +727,8 @@ export function App() {
     ? `Provenance: ${profileEntry.attribution.notes}`
     : 'Provenance: totals come from leaderboard artifact defaults and can include repo-wide signal when strict authored attribution is unavailable.';
   const profileRival = useMemo(() => (profileEntry ? findNearestRival(profileEntry, sortedEntries) : null), [profileEntry, sortedEntries]);
+  const profileScanAction = useMemo(() => (profileEntry ? buildScanActionRecommendation(profileEntry) : null), [profileEntry]);
+  const profileScanTargetRepoUrl = profileEntry?.featuredRepo ?? profileEntry?.repos[0]?.repo.url ?? null;
 
   useEffect(() => {
     setInsightIndex(0);
@@ -724,6 +802,18 @@ export function App() {
       setView(nextView);
     }
     navigate({ kind: 'home' });
+  }
+
+  function startScanFromRepo(repoUrl: string, source: string) {
+    setRepoInput(repoUrl);
+    setScanError(null);
+    setView('scan');
+    navigate({ kind: 'home' });
+    trackUxEvent('scan_hook_clicked', {
+      source,
+      repoUrl,
+      signedIn: Boolean(authIdentity),
+    });
   }
 
   function openProfile(handle: string, options: { challengeTargetHandle?: string | null } = {}) {
@@ -1045,19 +1135,15 @@ export function App() {
       challengeTelemetrySignatureRef.current = '';
       return;
     }
-    if (!route.challengeTargetHandle && !route.hasInvalidChallengeQuery) {
+    const resolution = resolveChallengeDeepLinkResolution({
+      route,
+      challengerHandle: profileEntry?.handle ?? null,
+      targetHandle: challengeTargetEntry?.handle ?? null,
+    });
+    if (resolution === 'none') {
       challengeTelemetrySignatureRef.current = '';
       return;
     }
-    const resolution = route.hasInvalidChallengeQuery
-      ? 'invalid-query'
-      : !profileEntry
-        ? 'challenger-missing'
-        : !challengeTargetEntry
-          ? 'target-missing'
-          : challengeTargetEntry.handle === profileEntry.handle
-            ? 'self-target'
-            : 'compare-ready';
     const signature = `${route.handle}:${route.challengeTargetHandle ?? 'none'}:${Number(route.hasInvalidChallengeQuery)}:${resolution}`;
     if (challengeTelemetrySignatureRef.current === signature) {
       return;
@@ -1386,6 +1472,27 @@ export function App() {
                   )
                 ) : null}
                 <p className="mt-4 max-w-4xl rounded-lg border border-slate-700 bg-surface-2 px-3 py-2 text-xs leading-relaxed text-ink-2">{profileAttributionSummary}</p>
+                {profileScanAction ? (
+                  <div className="mt-3 rounded-lg border border-cyan-400/40 bg-cyan-500/10 p-3">
+                    <p className="font-mono text-xs uppercase tracking-[0.08em] text-cyan-100">Velocity to Scan Action Loop</p>
+                    <p className="mt-1 text-sm text-cyan-100">{profileScanAction.headline}</p>
+                    <p className="mt-1 text-xs text-cyan-100/90">{profileScanAction.detail}</p>
+                    <p className="mt-2 text-xs text-cyan-100/85">
+                      AI-readiness remains trust-labeled until repo-level Scan payloads are connected.
+                    </p>
+                    {profileScanTargetRepoUrl ? (
+                      <button
+                        className="mt-3 min-h-11 rounded-md border border-cyan-300/60 bg-cyan-500/20 px-3 py-2 text-xs font-mono text-cyan-100 hover:bg-cyan-500/30"
+                        onClick={() => startScanFromRepo(profileScanTargetRepoUrl, 'profile_action_loop')}
+                        type="button"
+                      >
+                        Scan Featured Repo For Next Fix
+                      </button>
+                    ) : (
+                      <p className="mt-2 text-xs text-cyan-100/80">No featured repo URL is available yet for this profile.</p>
+                    )}
+                  </div>
+                ) : null}
 
                 <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-5">
                   <div className="rounded-lg border border-slate-700 bg-surface-2 p-3">
@@ -1576,8 +1683,13 @@ export function App() {
                       <p className="rounded-lg border border-dashed border-slate-700 p-4 text-sm text-ink-2">No repository snapshots available for this handle.</p>
                     ) : (
                       profileEntry.repos.map((repoCard) => {
-                        // TODO(api): expose repo-level AI readiness + pipeline stage in leaderboard/profile payload.
-                        const repoAiReady = null as number | null;
+                        const repoAiReady = typeof profileEntry.aiReadyScore === 'number' ? profileEntry.aiReadyScore : null;
+                        const repoActionInsight =
+                          profileEntry.scanInsight ?? profileScanAction?.detail ?? 'Run Mentat Scan to generate a concrete next fix for this repo.';
+                        const repoTrustLabel =
+                          repoCard.attribution.mode === 'handle-authored'
+                            ? `Strict attribution (@${repoCard.attribution.targetHandle ?? profileEntry.handle})`
+                            : 'Repo-wide attribution (non-bot default-branch activity)';
                         return (
                           <div key={repoCard.repo.url} className="rounded-lg border border-slate-700 bg-surface-2 p-3">
                             <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1601,9 +1713,20 @@ export function App() {
                               </div>
                               <div className="rounded border border-slate-700 p-2">
                                 <p className="font-mono text-xs uppercase tracking-[0.08em] text-ink-3">AI-Ready</p>
-                                <p className="font-mono text-sm text-ink-2">{repoAiReady === null ? 'Data unavailable in MVP' : `${repoAiReady}%`}</p>
+                                <p className="font-mono text-sm text-ink-2">{repoAiReady === null ? 'Trust-labeled pending Scan payload' : `${repoAiReady}%`}</p>
                               </div>
                             </div>
+                            <p className="mt-2 rounded border border-slate-700 px-2 py-1 text-xs text-ink-2">Trust context: {repoTrustLabel}</p>
+                            <p className="mt-2 rounded border border-cyan-400/35 bg-cyan-500/10 px-2 py-1 text-xs text-cyan-100">
+                              {formatNextFixDetail(repoActionInsight)}
+                            </p>
+                            <button
+                              className="mt-2 min-h-11 rounded border border-cyan-400/50 bg-cyan-500/10 px-3 py-2 text-xs font-mono text-cyan-100 hover:bg-cyan-500/20"
+                              onClick={() => startScanFromRepo(repoCard.repo.url, 'profile_repo_card')}
+                              type="button"
+                            >
+                              Run Mentat Scan On This Repo
+                            </button>
                           </div>
                         );
                       })
@@ -1677,7 +1800,7 @@ export function App() {
                   <div>
                     <h2 className="font-display text-3xl leading-tight">Mentat Velocity Snapshot</h2>
                     <p className="mt-1 text-sm text-ink-2">
-                      30-day snapshots for seeded handles. Leaderboard refresh prefers strict handle-authored attribution; manual scans may remain repo-wide.
+                      30-day snapshots for seeded and claimed handles. Canonical ranking uses strict handle-authored attribution and explicit persistence eligibility.
                     </p>
                   </div>
                   <div className="flex items-center gap-2 rounded-lg bg-surface-2 p-1">
@@ -1875,6 +1998,7 @@ export function App() {
                     ) : null}
                     {sortedEntries.map((entry) => {
                       const percentile = getPercentile(entry, sortedEntries.length);
+                      const scanAction = buildScanActionRecommendation(entry);
                       const nextHigher = sortedEntries.find((candidate) => candidate.rank === entry.rank - 1) ?? null;
                       const eehGapToNext = nextHigher ? nextHigher.totals.equivalentEngineeringHours - entry.totals.equivalentEngineeringHours : null;
                       const shareEntryUrl = buildProfileUrl(appOrigin, entry.handle);
@@ -1919,7 +2043,19 @@ export function App() {
                               <p className="font-mono text-sm text-state-success">#1 pace</p>
                             </div>
                           )}
+                          <p className="mt-2 rounded border border-cyan-400/35 bg-cyan-500/10 px-2 py-1 text-xs text-cyan-100">
+                            {formatNextFixDetail(entry.scanInsight ?? scanAction.detail)}
+                          </p>
                           <div className="mt-3 flex items-center gap-2">
+                            {entry.featuredRepo ? (
+                              <button
+                                className="min-h-11 min-w-11 rounded border border-emerald-400/50 bg-emerald-500/10 px-3 py-2 text-[11px] font-mono text-emerald-100 hover:bg-emerald-500/20"
+                                onClick={() => startScanFromRepo(entry.featuredRepo!, 'leaderboard_mobile_row')}
+                                type="button"
+                              >
+                                Scan
+                              </button>
+                            ) : null}
                             <button
                               className="min-h-11 min-w-11 rounded border border-cyan-400/50 bg-cyan-500/10 px-3 py-2 text-[11px] font-mono text-cyan-100 hover:bg-cyan-500/20"
                               onClick={() =>
@@ -2034,12 +2170,21 @@ export function App() {
                               </button>
                               <p className="font-mono text-xs text-ink-3">{entry.scannedRepos} repo(s) scanned</p>
                               {entry.aiReadyScore === undefined ? (
-                                <p className="font-mono text-xs text-ink-3">AI-Ready: pending</p>
+                                <p className="font-mono text-xs text-ink-3">AI-Ready: trust-labeled pending Scan payload</p>
                               ) : (
                                 <p className="font-mono text-xs text-ink-3">AI-Ready: {entry.aiReadyScore}%</p>
                               )}
-                              {entry.scanInsight ? <p className="font-mono text-xs text-ink-3">{entry.scanInsight}</p> : null}
+                              <p className="font-mono text-xs text-ink-3">{entry.scanInsight ?? buildScanActionRecommendation(entry).detail}</p>
                               <div className="mt-2 flex flex-wrap gap-2">
+                                {entry.featuredRepo ? (
+                                  <button
+                                    className="min-h-11 rounded border border-emerald-400/50 bg-emerald-500/10 px-3 py-2 font-mono text-[11px] text-emerald-100 hover:bg-emerald-500/20"
+                                    onClick={() => startScanFromRepo(entry.featuredRepo!, 'leaderboard_table_row')}
+                                    type="button"
+                                  >
+                                    Run Scan
+                                  </button>
+                                ) : null}
                                 <button
                                   className="min-h-11 rounded border border-cyan-400/50 bg-cyan-500/10 px-3 py-2 font-mono text-[11px] text-cyan-100 hover:bg-cyan-500/20"
                                   onClick={() =>

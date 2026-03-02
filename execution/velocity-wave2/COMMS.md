@@ -32,6 +32,17 @@ Resolution notes:
 ### 2026-03-02
 
 Date: 2026-03-02
+From Team: Program Lead
+To Team: Product Loop, QA Verification, Platform Ops
+Task IDs: W2-003, W2-004, W2-020, Gate E, Gate F
+Subject: Wave 2 closure verification complete
+Message: Product Loop and QA gap closures are deployed. Staging and production both passed remote smoke checks (`/api/health`, `/api/leaderboard`, `/api/scan`) and live leaderboard payloads no longer emit legacy placeholder scan insights.
+Action requested: Update board/team trackers to final `DONE` state and lock Wave 2 scope.
+Due: 2026-03-02
+Status: RESOLVED
+Resolution notes: `BOARD.md` + team docs updated; Gate E/F checked; deploy evidence captured with staging version `d2edbf2a-4b06-42e5-adad-549ff64378b2` and production version `542a167e-7b77-4924-9824-bfa074881cc7`.
+
+Date: 2026-03-02
 From Team: Product Loop + Growth UX
 To Team: QA Verification
 Task IDs: W2-002, W2-015, W2-020
@@ -39,8 +50,8 @@ Subject: Challenge deep-link contract implemented and ready for regression conve
 Message: Client now consumes `?challenge=` on `/v/:handle` routes in `apps/velocity-mvp/src/client/App.tsx`. Valid links render a compare destination card; invalid/missing targets render explicit non-dead-end fallback states. Signed-out challenge generation now avoids pseudo-handle links and routes users through claim-profile gating.
 Action requested: Convert W2-020 challenge-loop `todo` coverage to executable assertions using the new landing contract and validate signed-out recovery paths.
 Due: 2026-03-03
-Status: OPEN
-Resolution notes:
+Status: RESOLVED
+Resolution notes: QA converted challenge-loop contract coverage into executable route tests in `apps/velocity-mvp/src/client/App.route.test.ts`; `W2-020` closed.
 
 Date: 2026-03-02
 From Team: Growth UX
@@ -72,8 +83,8 @@ Subject: Data-integrity trust fixes landed; request downstream verification + ca
 Message: Implemented trust fixes in `apps/velocity-mvp/src/worker/index.ts`, `apps/velocity-mvp/src/shared/scanService.ts`, `apps/velocity-mvp/src/shared/github.ts`, and `apps/velocity-mvp/src/worker/data/db.ts` with regression coverage in `apps/velocity-mvp/src/worker/index.test.ts` and `apps/velocity-mvp/src/worker/data/db.integration.test.ts`. `/api/scan` now exposes canonical-owner resolution + ranking eligibility metadata and `thirtyDay` now uses latest-per-repo semantics.
 Action requested: QA rerun W2-019/W2-020 regressions on latest branch and confirm final assertions; Platform Ops confirm W2-008 cache invalidation behavior aligns with canonical write eligibility semantics.
 Due: 2026-03-03
-Status: OPEN
-Resolution notes:
+Status: RESOLVED
+Resolution notes: QA rerun passed (`src/worker/index.test.ts`, `src/worker/data/db.integration.test.ts`, `src/client/App.route.test.ts`) and platform cache behavior remained aligned post-deploy.
 
 Date: 2026-03-02
 From Team: QA Verification
@@ -94,8 +105,8 @@ Subject: Challenge deep-link landing contract needed for QA completion
 Message: W2-020 now includes route-level canonical-policy regressions and a challenge-loop placeholder test (`it.todo`) in `apps/velocity-mvp/src/worker/index.test.ts`, but we cannot finalize deep-link parse/landing coverage until `?challenge=` routing behavior is implemented and documented in a stable contract.
 Action requested: Share expected challenge landing contract (signed-in and signed-out paths, compare destination behavior, URL/query handling) and flag when W2-002 implementation is ready for QA conversion from `todo` to executable assertions.
 Due: 2026-03-03
-Status: OPEN
-Resolution notes:
+Status: RESOLVED
+Resolution notes: Product Loop shared and shipped deep-link contract, QA coverage landed, and challenge routing is now validated end-to-end.
 
 Date: 2026-03-02
 From Team: Program Lead
@@ -105,5 +116,5 @@ Subject: Wave 2 kickoff
 Message: Independent audit identified remaining critical trust and growth gaps. Team docs are now scoped for Wave 2 execution.
 Action requested: Confirm owner + ETA in your team doc and start with highest-severity open item.
 Due: 2026-03-03
-Status: OPEN
-Resolution notes:
+Status: RESOLVED
+Resolution notes: All Wave 2 tasks (`W2-001..W2-020`) are marked `DONE` in `BOARD.md` with final verification evidence logged in team docs.

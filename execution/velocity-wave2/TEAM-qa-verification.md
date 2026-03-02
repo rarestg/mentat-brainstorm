@@ -1,7 +1,7 @@
 # Team: QA Verification
 
 Owner: Carson
-Status: IN_PROGRESS
+Status: DONE
 
 ## Scope
 
@@ -58,19 +58,19 @@ Refs:
 - `apps/velocity-mvp/src/worker/index.ts:853`
 
 Acceptance Criteria:
-- [ ] tests cover challenge deep-link parse/landing scenarios
-- [ ] tests cover persisted vs non-persisted scan CTA metadata paths
-- [ ] tests cover strict attribution and canonical-owner verification cases
+- [x] tests cover challenge deep-link parse/landing scenarios
+- [x] tests cover persisted vs non-persisted scan CTA metadata paths
+- [x] tests cover strict attribution and canonical-owner verification cases
 
 Status:
-- BLOCKED on W2-002 / W2-005 / W2-006 contracts and implementation
+- DONE
 
 ## Checklist
 
 - [x] W2-018 fixed
 - [x] W2-019 fixed
-- [ ] W2-020 fixed
-- [ ] full verification report posted
+- [x] W2-020 fixed
+- [x] full verification report posted
 
 ## Dependencies / Requests
 
@@ -78,6 +78,21 @@ Status:
 - Platform Ops for failure-mode test hooks and staging validation windows.
 
 ## Work Log
+
+Date: 2026-03-02
+Engineer: Program follow-up
+Tasks touched: W2-020
+What changed:
+- Added challenge deep-link route contract tests in `apps/velocity-mvp/src/client/App.route.test.ts`.
+- Removed `it.todo` blocker from `apps/velocity-mvp/src/worker/index.test.ts` and validated canonical policy assertions on latest implementation.
+- Revalidated QA lane on deployed staging + production workers after final Product Loop fixes.
+Validation:
+- `npm run test -- src/client/App.route.test.ts src/worker/index.test.ts src/worker/data/db.test.ts src/worker/data/db.integration.test.ts` (pass; 57 tests)
+- `npm run typecheck` (pass)
+- staging smoke checks (`/api/health`, `/api/leaderboard`, `/api/scan`) pass on `2026-03-02`
+- production smoke checks (`/api/health`, `/api/leaderboard`, `/api/scan`) pass on `2026-03-02`
+Open questions:
+- None.
 
 Date: 2026-03-02
 Engineer: Carson

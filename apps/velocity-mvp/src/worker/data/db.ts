@@ -199,6 +199,54 @@ function buildRotatingInsights(
   return insights.slice(0, PROFILE_ROTATING_INSIGHTS_LIMIT);
 }
 
+function buildScanActionInsightFromTotals(totals: {
+  mergedPrsUnverified: number;
+  mergedPrsCiVerified: number;
+  offHoursRatio: number;
+  velocityAcceleration: number;
+  commitsPerDay: number;
+}): string {
+  if (totals.mergedPrsUnverified > 0) {
+    const ciCoverage = totals.mergedPrsCiVerified / Math.max(1, totals.mergedPrsUnverified);
+    if (ciCoverage < 0.7) {
+      return `Next fix: improve CI verification coverage (${Math.round(ciCoverage * 100)}%) on merged PRs.`;
+    }
+  }
+  if (totals.offHoursRatio > 0.45) {
+    return `Next fix: reduce off-hours concentration (${Math.round(totals.offHoursRatio * 100)}%) by shifting core merge windows.`;
+  }
+  if (totals.velocityAcceleration < 0) {
+    return 'Next fix: reverse negative acceleration by restoring weekly merged PR throughput.';
+  }
+  if (totals.commitsPerDay < 1.5) {
+    return 'Next fix: increase consistent commit cadence before next leaderboard refresh.';
+  }
+  return 'Next fix: run Mentat Scan on your top repo for AI-readiness action items.';
+}
+
+function normalizeScanInsight(scanInsight: string | null | undefined, totals: {
+  mergedPrsUnverified: number;
+  mergedPrsCiVerified: number;
+  offHoursRatio: number;
+  velocityAcceleration: number;
+  commitsPerDay: number;
+}): string {
+  const trimmed = typeof scanInsight === 'string' ? scanInsight.trim() : '';
+  if (!trimmed) {
+    return buildScanActionInsightFromTotals(totals);
+  }
+
+  const normalized = trimmed.toLowerCase();
+  if (
+    normalized.includes('mentat scan link pending in mvp') ||
+    normalized.includes('live scan ingestion from /api/scan')
+  ) {
+    return buildScanActionInsightFromTotals(totals);
+  }
+
+  return trimmed;
+}
+
 function authoritativeProvenance(source: string, capturedAt?: string): MetricBlockProvenance {
   return {
     state: 'authoritative',
@@ -226,6 +274,281 @@ interface HeatmapPayload {
   throughputHeatmap?: number[][];
   capturedAt?: string;
   reason?: string;
+}
+
+function buildFallbackRepoWindows(metrics: RepoReportCard['metrics']): RepoReportCard['windows'] {
+  return [
+    {
+      label: 'current30d',
+      commitCount: Math.max(0, Math.round(toNumber(metrics.commitsPerDay) * 30)),
+      mergedPrCountUnverified: Math.max(0, Math.round(toNumber(metrics.mergedPrsUnverified))),
+      mergedPrCountCiVerified: Math.max(0, Math.round(toNumber(metrics.mergedPrsCiVerified))),
+      mergedPrCount: Math.max(0, Math.round(toNumber(metrics.mergedPrs))),
+      activeCodingHours: round2(Math.max(0, toNumber(metrics.activeCodingHours))),
+      offHoursRatio: round2(Math.max(0, toNumber(metrics.offHoursRatio))),
+      equivalentEngineeringHours: round2(Math.max(0, toNumber(metrics.equivalentEngineeringHours))),
+    },
+    {
+      label: 'previous30d',
+      commitCount: 0,
+      mergedPrCountUnverified: 0,
+      mergedPrCountCiVerified: 0,
+      mergedPrCount: 0,
+      activeCodingHours: 0,
+      offHoursRatio: 0,
+      equivalentEngineeringHours: 0,
+    },
+  ];
+}
+
+function parseRepoAssumptions(assumptionsJson: string | null): RepoReportCard['assumptions'] {
+  const fallback: RepoReportCard['assumptions'] = {
+    offHoursDefinitionUtc: 'off-hours are unique commit-hour buckets outside 09:00-18:00 UTC.',
+    equivalentEngineeringHoursFormula:
+      'sum over 30 UTC days of min(12, 0.8*uniqueHours + 0.3*min(commits, 2*uniqueHours+1) + 1.5*min(ciVerifiedMergedPRs,3)).',
+    defaultBranchScope: 'Default branch scope unavailable for this snapshot.',
+    ciVerification: 'CI verification assumptions unavailable for this snapshot.',
+  };
+
+  if (!assumptionsJson) {
+    return fallback;
+  }
+
+  try {
+    const parsed = JSON.parse(assumptionsJson) as unknown;
+    if (!parsed || typeof parsed !== 'object') {
+      return fallback;
+    }
+    const shape = parsed as Partial<RepoReportCard['assumptions']>;
+    return {
+      offHoursDefinitionUtc: toStringValue(shape.offHoursDefinitionUtc, fallback.offHoursDefinitionUtc),
+      equivalentEngineeringHoursFormula: toStringValue(shape.equivalentEngineeringHoursFormula, fallback.equivalentEngineeringHoursFormula),
+      defaultBranchScope: toStringValue(shape.defaultBranchScope, fallback.defaultBranchScope),
+      ciVerification: toStringValue(shape.ciVerification, fallback.ciVerification),
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function parseRepoWindows(
+  windowsJson: string | null,
+  metrics: RepoReportCard['metrics'],
+): RepoReportCard['windows'] {
+  const fallback = buildFallbackRepoWindows(metrics);
+  if (!windowsJson) {
+    return fallback;
+  }
+
+  try {
+    const parsed = JSON.parse(windowsJson) as unknown;
+    if (!Array.isArray(parsed)) {
+      return fallback;
+    }
+    const sanitized: RepoReportCard['windows'] = [];
+    for (const item of parsed) {
+      if (!item || typeof item !== 'object') {
+        continue;
+      }
+      const row = item as Record<string, unknown>;
+      const label = toStringValue(row.label);
+      if (label !== 'current30d' && label !== 'previous30d') {
+        continue;
+      }
+      sanitized.push({
+        label,
+        commitCount: Math.max(0, Math.round(toNumber(row.commitCount))),
+        mergedPrCountUnverified: Math.max(0, Math.round(toNumber(row.mergedPrCountUnverified))),
+        mergedPrCountCiVerified: Math.max(0, Math.round(toNumber(row.mergedPrCountCiVerified))),
+        mergedPrCount: Math.max(0, Math.round(toNumber(row.mergedPrCount))),
+        activeCodingHours: round2(Math.max(0, toNumber(row.activeCodingHours))),
+        offHoursRatio: round2(Math.max(0, toNumber(row.offHoursRatio))),
+        equivalentEngineeringHours: round2(Math.max(0, toNumber(row.equivalentEngineeringHours))),
+        throughputHeatmap: isValidHeatmapMatrix(row.throughputHeatmap) ? normalizeHeatmapCounts(row.throughputHeatmap) : undefined,
+      });
+    }
+    if (sanitized.length === 0) {
+      return fallback;
+    }
+    const current = sanitized.find((entry) => entry.label === 'current30d') ?? fallback[0];
+    const previous = sanitized.find((entry) => entry.label === 'previous30d') ?? fallback[1];
+    return [current, previous];
+  } catch {
+    return fallback;
+  }
+}
+
+function parseStoredAttribution(
+  attributionJson: string | null,
+  fallback: {
+    attribution_mode: unknown;
+    attribution_source: unknown;
+    attribution_target_handle: unknown;
+    attribution_strict: unknown;
+  },
+): AttributionTransparency {
+  if (attributionJson) {
+    try {
+      const parsed = JSON.parse(attributionJson) as unknown;
+      if (parsed && typeof parsed === 'object') {
+        return normalizeAttribution(parsed as AttributionTransparency);
+      }
+    } catch {
+      // Fall through to DB-column fallback attribution.
+    }
+  }
+  return parseAttributionFromRow(fallback);
+}
+
+interface LatestRepoCardSqlRow {
+  user_id: number;
+  snapshot_id: number;
+  scanned_at: string;
+  owner: string;
+  name: string;
+  url: string;
+  commits_per_day: number;
+  merged_prs_unverified: number;
+  merged_prs_ci_verified: number;
+  merged_prs: number;
+  active_coding_hours: number;
+  off_hours_ratio: number;
+  velocity_acceleration: number;
+  equivalent_engineering_hours: number;
+  attribution_mode: string;
+  attribution_source: string;
+  attributed_handle: string | null;
+  attribution_strict: number;
+  assumptions_json: string | null;
+  windows_json: string | null;
+  attribution_json: string | null;
+  user_repo_rank: number;
+}
+
+async function loadLatestRepoCardsByUserId(
+  db: D1Database,
+  userIds: number[],
+  limitPerUser = 3,
+): Promise<Map<number, RepoReportCard[]>> {
+  const cardsByUserId = new Map<number, RepoReportCard[]>();
+  if (userIds.length === 0) {
+    return cardsByUserId;
+  }
+
+  const placeholders = buildInClausePlaceholders(userIds);
+  const rowsResult = await db
+    .prepare(
+      `WITH latest_repo_scans AS (
+         SELECT
+           s.user_id,
+           s.repo_id,
+           s.id AS snapshot_id,
+           s.scanned_at,
+           s.commits_per_day,
+           s.merged_prs_unverified,
+           s.merged_prs_ci_verified,
+           s.merged_prs,
+           s.active_coding_hours,
+           s.off_hours_ratio,
+           s.velocity_acceleration,
+           s.equivalent_engineering_hours,
+           s.attribution_mode,
+           s.attribution_source,
+           s.attributed_handle,
+           s.attribution_strict,
+           ROW_NUMBER() OVER (
+             PARTITION BY s.user_id, s.repo_id
+             ORDER BY datetime(s.scanned_at) DESC, s.id DESC
+           ) AS repo_rank
+         FROM snapshots s
+         WHERE s.snapshot_type = 'scan'
+           AND s.repo_id IS NOT NULL
+           AND s.user_id IN (${placeholders})
+       ),
+       ranked_latest AS (
+         SELECT
+           lrs.*,
+           r.owner,
+           r.name,
+           r.url,
+           sc.assumptions_json,
+           sc.windows_json,
+           sc.attribution_json,
+           ROW_NUMBER() OVER (
+             PARTITION BY lrs.user_id
+             ORDER BY lrs.equivalent_engineering_hours DESC, datetime(lrs.scanned_at) DESC, lrs.snapshot_id DESC
+           ) AS user_repo_rank
+         FROM latest_repo_scans lrs
+         INNER JOIN repos r ON r.id = lrs.repo_id
+         LEFT JOIN scans sc ON sc.snapshot_id = lrs.snapshot_id
+         WHERE lrs.repo_rank = 1
+       )
+       SELECT
+         user_id,
+         snapshot_id,
+         scanned_at,
+         owner,
+         name,
+         url,
+         commits_per_day,
+         merged_prs_unverified,
+         merged_prs_ci_verified,
+         merged_prs,
+         active_coding_hours,
+         off_hours_ratio,
+         velocity_acceleration,
+         equivalent_engineering_hours,
+         attribution_mode,
+         attribution_source,
+         attributed_handle,
+         attribution_strict,
+         assumptions_json,
+         windows_json,
+         attribution_json,
+         user_repo_rank
+       FROM ranked_latest
+       WHERE user_repo_rank <= ${Math.max(1, Math.floor(limitPerUser))}
+       ORDER BY user_id ASC, user_repo_rank ASC`,
+    )
+    .bind(...userIds)
+    .all<LatestRepoCardSqlRow>();
+
+  for (const row of rowsResult.results ?? []) {
+    const metrics: RepoReportCard['metrics'] = {
+      commitsPerDay: round2(Math.max(0, toNumber(row.commits_per_day))),
+      mergedPrsUnverified: Math.max(0, Math.round(toNumber(row.merged_prs_unverified))),
+      mergedPrsCiVerified: Math.max(0, Math.round(toNumber(row.merged_prs_ci_verified))),
+      mergedPrs: Math.max(0, Math.round(toNumber(row.merged_prs))),
+      activeCodingHours: round2(Math.max(0, toNumber(row.active_coding_hours))),
+      offHoursRatio: round2(Math.max(0, toNumber(row.off_hours_ratio))),
+      velocityAcceleration: round2(toNumber(row.velocity_acceleration)),
+      equivalentEngineeringHours: round2(Math.max(0, toNumber(row.equivalent_engineering_hours))),
+    };
+
+    const card: RepoReportCard = {
+      repo: {
+        owner: toStringValue(row.owner),
+        name: toStringValue(row.name),
+        url: toStringValue(row.url),
+      },
+      scannedAt: toStringValue(row.scanned_at),
+      attribution: parseStoredAttribution(row.attribution_json, {
+        attribution_mode: row.attribution_mode,
+        attribution_source: row.attribution_source,
+        attribution_target_handle: row.attributed_handle,
+        attribution_strict: row.attribution_strict,
+      }),
+      assumptions: parseRepoAssumptions(row.assumptions_json),
+      windows: parseRepoWindows(row.windows_json, metrics),
+      metrics,
+    };
+
+    const existing = cardsByUserId.get(row.user_id) ?? [];
+    existing.push(card);
+    cardsByUserId.set(row.user_id, existing);
+  }
+
+  return cardsByUserId;
 }
 
 interface HistoryTrendSqlRow {
@@ -1431,7 +1754,13 @@ export async function persistScanReport(db: D1Database, report: RepoReportCard):
     handle: toStringValue(handleRow?.handle, report.repo.owner),
     scannedRepos: Math.max(1, Math.round(toNumber(aggregate.scanned_repos, 1))),
     featuredRepo: aggregate.featured_repo ?? report.repo.url,
-    scanInsight: 'Live scan ingestion from /api/scan.',
+    scanInsight: buildScanActionInsightFromTotals({
+      mergedPrsUnverified: Math.round(toNumber(aggregate.total_merged_prs_unverified)),
+      mergedPrsCiVerified: Math.round(toNumber(aggregate.total_merged_prs_ci_verified)),
+      offHoursRatio: round2(toNumber(aggregate.total_off_hours_ratio)),
+      velocityAcceleration: round2(toNumber(aggregate.total_velocity_acceleration)),
+      commitsPerDay: round2(toNumber(aggregate.total_commits_per_day)),
+    }),
     attribution: parseAttributionFromRow(aggregate),
     totals: {
       equivalentEngineeringHours: round2(toNumber(aggregate.total_equivalent_engineering_hours)),
@@ -1578,10 +1907,11 @@ export async function getLeaderboardArtifact(db: D1Database): Promise<Leaderboar
 
   const rows = rowsResult.results ?? [];
   const userIds = rows.map((row) => toNumber(row.user_id)).filter((userId) => userId > 0);
-  const [crownsByHandle, trendPayloadByUserId, heatmapPayloadByUserId] = await Promise.all([
+  const [crownsByHandle, trendPayloadByUserId, heatmapPayloadByUserId, repoCardsByUserId] = await Promise.all([
     loadCrownsByHandle(db),
     loadTrendPayloadByUserId(db, userIds),
     loadHeatmapPayloadByUserId(db, userIds),
+    loadLatestRepoCardsByUserId(db, userIds, 3),
   ]);
 
   const entries: LeaderboardEntry[] = rows.map((row, index) => {
@@ -1605,6 +1935,13 @@ export async function getLeaderboardArtifact(db: D1Database): Promise<Leaderboar
       offHoursRatio: round2(toNumber(row.total_off_hours_ratio)),
       velocityAcceleration: round2(toNumber(row.total_velocity_acceleration)),
     };
+    const scanInsight = normalizeScanInsight(row.scan_insight, {
+      mergedPrsUnverified: totals.mergedPrsUnverified,
+      mergedPrsCiVerified: totals.mergedPrsCiVerified,
+      offHoursRatio: totals.offHoursRatio,
+      velocityAcceleration: totals.velocityAcceleration,
+      commitsPerDay: totals.commitsPerDay,
+    });
     const rotatingInsights = buildRotatingInsights({ rank, totals }, percentile, trendPayload.trendPoints ?? []);
     const provenance = buildProfileProvenance({
       totalsCapturedAt,
@@ -1619,7 +1956,7 @@ export async function getLeaderboardArtifact(db: D1Database): Promise<Leaderboar
       scannedRepos: toNumber(row.scanned_repos),
       featuredRepo: row.featured_repo ?? undefined,
       aiReadyScore: row.ai_ready_score === null ? undefined : toNumber(row.ai_ready_score),
-      scanInsight: row.scan_insight ?? undefined,
+      scanInsight,
       percentile,
       stackTier: inferOperatingStackTier({
         commitsPerDay: toNumber(row.total_commits_per_day),
@@ -1642,7 +1979,7 @@ export async function getLeaderboardArtifact(db: D1Database): Promise<Leaderboar
         rotatingInsights,
       },
       totals,
-      repos: [],
+      repos: repoCardsByUserId.get(row.user_id) ?? [],
     };
   });
 
@@ -1751,7 +2088,10 @@ export async function getProfileByHandle(db: D1Database, handle: string): Promis
       active_coding_hours: number;
     }>();
 
-  const heatmapPayloadByUserId = await loadHeatmapPayloadByUserId(db, [row.user_id]);
+  const [heatmapPayloadByUserId, repoCardsByUserId] = await Promise.all([
+    loadHeatmapPayloadByUserId(db, [row.user_id]),
+    loadLatestRepoCardsByUserId(db, [row.user_id], 5),
+  ]);
   const heatmapPayload = heatmapPayloadByUserId.get(row.user_id) ?? { reason: 'no-scan-history' };
 
   const totalRows = Math.max(1, toNumber(row.total_rows, 1));
@@ -1807,6 +2147,13 @@ export async function getProfileByHandle(db: D1Database, handle: string): Promis
     offHoursRatio: round2(toNumber(row.total_off_hours_ratio)),
     velocityAcceleration: round2(toNumber(row.total_velocity_acceleration)),
   };
+  const scanInsight = normalizeScanInsight(row.scan_insight, {
+    mergedPrsUnverified: totals.mergedPrsUnverified,
+    mergedPrsCiVerified: totals.mergedPrsCiVerified,
+    offHoursRatio: totals.offHoursRatio,
+    velocityAcceleration: totals.velocityAcceleration,
+    commitsPerDay: totals.commitsPerDay,
+  });
   const rotatingInsights = buildRotatingInsights({ rank, totals }, percentile, trendPayload.trendPoints ?? []);
   const totalsCapturedAt = isIsoTimestamp(row.leaderboard_updated_at) ? row.leaderboard_updated_at : undefined;
   const provenance = buildProfileProvenance({
@@ -1822,7 +2169,7 @@ export async function getProfileByHandle(db: D1Database, handle: string): Promis
     scannedRepos: toNumber(row.scanned_repos),
     featuredRepo: row.featured_repo ?? undefined,
     aiReadyScore: row.ai_ready_score === null ? undefined : toNumber(row.ai_ready_score),
-    scanInsight: row.scan_insight ?? undefined,
+    scanInsight,
     percentile,
     stackTier,
     attribution: parseAttributionFromRow(row),
@@ -1841,7 +2188,7 @@ export async function getProfileByHandle(db: D1Database, handle: string): Promis
       rotatingInsights,
     },
     totals,
-    repos: [],
+    repos: repoCardsByUserId.get(row.user_id) ?? [],
   };
 
   return {

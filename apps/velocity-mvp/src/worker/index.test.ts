@@ -1219,8 +1219,6 @@ describe('worker routes', () => {
     expect(body.persistence?.reason).toBe('persisted');
   });
 
-  it.todo('W2-020 challenge loop: cover ?challenge=<handle> parse + landing behavior after W2-002 route contract is implemented.');
-
   it('returns explicit missing-env error for GitHub OAuth start', async () => {
     const response = await app.request('http://localhost/api/auth/github/start', undefined, {
       DB: {} as D1Database,

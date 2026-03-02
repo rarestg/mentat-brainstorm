@@ -1,7 +1,7 @@
 # Team: Platform Ops
 
 Owner: Curie
-Status: IN_PROGRESS
+Status: DONE
 
 ## Scope
 
@@ -81,7 +81,7 @@ Acceptance Criteria:
 - [x] W2-009 fixed
 - [x] W2-010 fixed
 - [x] W2-011 fixed
-- [ ] staging + production smoke evidence attached
+- [x] staging + production smoke evidence attached
 
 ## Dependencies / Requests
 
@@ -89,6 +89,23 @@ Acceptance Criteria:
 - QA Verification for concurrency/failure-mode test coverage.
 
 ## Work Log
+
+Date: 2026-03-02
+Engineer: Program follow-up
+Tasks touched: Gate F validation
+What changed:
+- Ran remote migration/deploy validation for staging and production using enforced migration-before-deploy scripts.
+- Staging deploy completed with version `d2edbf2a-4b06-42e5-adad-549ff64378b2`; production deploy completed with version `542a167e-7b77-4924-9824-bfa074881cc7`.
+- Smoke checks executed on both workers.dev hosts for `/api/health`, `/api/leaderboard`, and `/api/scan`.
+Validation:
+- `npm run d1:migrate:staging` (pass; no migrations pending)
+- `npm run deploy:staging` (pass)
+- `npm run d1:migrate:production` (pass after one transient `fetch failed` retry)
+- `npm run deploy:production:worker` (pass)
+- `curl -fsS https://velocity-mvp-staging.rarestg.workers.dev/{api/health,api/leaderboard}` + POST `/api/scan` (pass)
+- `curl -fsS https://velocity-mvp-production.rarestg.workers.dev/{api/health,api/leaderboard}` + POST `/api/scan` (pass)
+Open questions:
+- None.
 
 Date: 2026-03-02
 Engineer: Curie

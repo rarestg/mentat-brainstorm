@@ -34,6 +34,31 @@ function buildSeededAttribution(handle: string): AttributionTransparency {
   };
 }
 
+function buildSeededScanActionInsight(params: {
+  mergedPrsUnverified: number;
+  mergedPrsCiVerified: number;
+  offHoursRatio: number;
+  velocityAcceleration: number;
+  commitsPerDay: number;
+}): string {
+  if (params.mergedPrsUnverified > 0) {
+    const ciCoverage = params.mergedPrsCiVerified / Math.max(1, params.mergedPrsUnverified);
+    if (ciCoverage < 0.7) {
+      return `Next fix: improve CI verification coverage (${Math.round(ciCoverage * 100)}%) on your core repos.`;
+    }
+  }
+  if (params.offHoursRatio > 0.45) {
+    return `Next fix: reduce off-hours merge concentration (${Math.round(params.offHoursRatio * 100)}%) to stabilize throughput.`;
+  }
+  if (params.velocityAcceleration < 0) {
+    return 'Next fix: recover momentum by increasing weekly merged PR throughput.';
+  }
+  if (params.commitsPerDay < 1.5) {
+    return 'Next fix: raise daily commit cadence and rerun Mentat Scan for a refreshed action plan.';
+  }
+  return 'Next fix: run Mentat Scan on your featured repo to unlock AI-readiness actions.';
+}
+
 export async function buildLeaderboard(seed: SeedCreator[], token?: string): Promise<LeaderboardArtifact> {
   const entries: LeaderboardEntry[] = [];
 
@@ -100,8 +125,13 @@ export async function buildLeaderboard(seed: SeedCreator[], token?: string): Pro
       scannedRepos: reports.length,
       featuredRepo: reports[0]?.repo.url,
       aiReadyScore: undefined,
-      scanInsight:
-        'Mentat Scan link pending in MVP. Seeded leaderboard refresh runs in strict handle-authored mode (GitHub author-login match only). Manual scan requests without a valid handle remain explicit repo-wide fallback.',
+      scanInsight: buildSeededScanActionInsight({
+        mergedPrsUnverified: totalMergedPrsUnverified,
+        mergedPrsCiVerified: totalMergedPrsCiVerified,
+        offHoursRatio: meanOffHoursRatio,
+        velocityAcceleration: meanAcceleration,
+        commitsPerDay: meanCommitsPerDay,
+      }),
       attribution: reports[0]?.attribution ?? buildSeededAttribution(normalizedHandle),
       totals: {
         equivalentEngineeringHours: Math.round(totalEquivalentHours * 100) / 100,

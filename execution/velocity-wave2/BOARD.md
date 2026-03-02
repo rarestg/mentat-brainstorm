@@ -28,8 +28,8 @@ Primary outcomes:
 |---|---|---|---|---|---|---|
 | W2-001 | Critical | Data Integrity | Seed refresh pruning deletes non-seed canonical entrants | Pasteur | DONE | None |
 | W2-002 | Critical | Product Loop | Challenge deep links (`?challenge=`) not consumed by app | Hegel | DONE | None |
-| W2-003 | High | Product Loop | Velocity -> Scan action loop still placeholder in MVP | Hegel | TODO | W2-006 |
-| W2-004 | High | Product Loop | Factory Floor payload is empty (`repos: []`) | Hegel | TODO | W2-003, W2-006 |
+| W2-003 | High | Product Loop | Velocity -> Scan action loop still placeholder in MVP | Hegel | DONE | W2-006 |
+| W2-004 | High | Product Loop | Factory Floor payload is empty (`repos: []`) | Hegel | DONE | W2-003, W2-006 |
 | W2-005 | High | Data Integrity | Canonical `/api/scan` persists repo-wide attribution by default | Pasteur | DONE | W2-006 |
 | W2-006 | High | Data Integrity | Owner authorization uses URL owner segment, not canonical GitHub owner identity | Pasteur | DONE | None |
 | W2-007 | High | Growth UX | Post-scan conversion path lacks persistence clarity + freshness reconciliation | Sagan | DONE | W2-005 |
@@ -45,7 +45,7 @@ Primary outcomes:
 | W2-017 | Medium | Growth UX | Return loop relies on local-only streak/delta (no server-backed rivalry progression) | Sagan | DONE | W2-002 |
 | W2-018 | Medium | QA Verification | Integration harness does not apply migration `0003` | Carson | DONE | None |
 | W2-019 | Medium | QA Verification | Missing regression for refresh preserving manual scan entrants | Carson | DONE | W2-001 |
-| W2-020 | High | QA Verification | Missing scenario coverage for challenge loop + canonical policy behavior | Carson | BLOCKED | W2-002, W2-005, W2-006 |
+| W2-020 | High | QA Verification | Missing scenario coverage for challenge loop + canonical policy behavior | Carson | DONE | W2-002, W2-005, W2-006 |
 
 ## Release Gates
 
@@ -53,18 +53,18 @@ Primary outcomes:
 - [x] Gate B: leaderboard trust tasks (`W2-001`, `W2-005`, `W2-006`, `W2-012`) are `DONE`
 - [x] Gate C: challenge + compare loop tasks (`W2-002`, `W2-015`) are `DONE`
 - [x] Gate D: platform safety tasks (`W2-008`, `W2-009`, `W2-010`) are `DONE`
-- [ ] Gate E: QA regression additions (`W2-018`, `W2-019`, `W2-020`) are merged and passing
-- [ ] Gate F: staging deploy + smoke + targeted scenario checks recorded
+- [x] Gate E: QA regression additions (`W2-018`, `W2-019`, `W2-020`) are merged and passing
+- [x] Gate F: staging deploy + smoke + targeted scenario checks recorded
 
 ## Progress Tracker
 
 | Metric | Target | Current |
 |---|---:|---:|
 | Critical done | 2 | 2 |
-| High done | 9 | 5 |
+| High done | 8 | 8 |
 | Medium done | 9 | 9 |
 | Low done | 1 | 1 |
-| Total done | 20 | 17 |
+| Total done | 20 | 20 |
 
 ## Standup Template
 
