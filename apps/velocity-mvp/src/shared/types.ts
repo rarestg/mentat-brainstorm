@@ -166,6 +166,64 @@ export interface LeaderboardEntryProvenance {
   };
 }
 
+export type TrustAnomalySeverity = 'low' | 'medium' | 'high';
+
+export type TrustAnomalyKey = 'ci-coverage-low' | 'off-hours-dominant' | 'commit-throughput-outlier';
+
+export interface TrustAnomalyFlag {
+  key: TrustAnomalyKey;
+  label: string;
+  severity: TrustAnomalySeverity;
+  reason: string;
+}
+
+export type VerifiedAgentOutputState = 'verified' | 'pending' | 'unknown';
+
+export type VerifiedAgentOutputReasonCode =
+  | 'eligible'
+  | 'readiness-missing'
+  | 'readiness-below-threshold'
+  | 'ci-coverage-unavailable'
+  | 'ci-coverage-below-threshold'
+  | 'freshness-stale';
+
+export interface VerifiedAgentOutputStatus {
+  state: VerifiedAgentOutputState;
+  label: string;
+  reason: string;
+  reasonCodes?: VerifiedAgentOutputReasonCode[];
+  readinessScore?: number;
+  readinessThreshold?: number;
+  ciCoverageRatio?: number;
+  ciCoverageThreshold?: number;
+  threshold?: number;
+}
+
+export interface LeaderboardEntryTrustSignals {
+  anomalies: TrustAnomalyFlag[];
+  verification: VerifiedAgentOutputStatus;
+}
+
+export type PayloadFreshnessStaleReasonCode =
+  | 'missing-snapshot-timestamp'
+  | 'snapshot-too-old'
+  | 'cache-version-fallback';
+
+export interface PayloadFreshness {
+  schemaVersion?: string;
+  source: 'server' | 'static-fallback';
+  cacheVersion: string;
+  latestSuccessfulRefreshRunId: number;
+  latestSnapshotId: number;
+  latestSuccessfulRefreshGeneratedAt?: string;
+  latestSuccessfulRefreshFinishedAt?: string;
+  latestSnapshotScannedAt?: string;
+  isStale?: boolean;
+  staleReasons?: PayloadFreshnessStaleReasonCode[];
+  computedAt?: string;
+  note?: string;
+}
+
 export interface LeaderboardEntry {
   rank: number;
   handle: string;
@@ -178,6 +236,7 @@ export interface LeaderboardEntry {
   crowns?: string[];
   attribution?: AttributionTransparency;
   provenance?: LeaderboardEntryProvenance;
+  trust?: LeaderboardEntryTrustSignals;
   thirtyDay?: LeaderboardThirtyDayMetrics;
   profile?: {
     tier?: string;
@@ -204,6 +263,7 @@ export interface LeaderboardEntry {
 export interface LeaderboardArtifact {
   generatedAt: string;
   sourceSeedPath: string;
+  freshness?: PayloadFreshness;
   dataSource?: {
     kind: 'd1' | 'static-artifact';
     fallback: boolean;
@@ -260,6 +320,7 @@ export interface ProfileResponse {
   leaderboard: LeaderboardEntry;
   history: ProfileMetricsHistoryPoint[];
   rivalry?: ProfileRivalryProgression;
+  freshness?: PayloadFreshness;
 }
 
 export interface GitHubCommit {

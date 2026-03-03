@@ -10,10 +10,21 @@ vi.mock('../shared/github', () => ({
 }));
 
 vi.mock('./data/db', () => ({
+  WAVE3_CONTRACT_SCHEMA_VERSION: '2026-03-wave3',
   ensureSeedData: vi.fn().mockResolvedValue(undefined),
   getLeaderboardArtifact: vi.fn().mockResolvedValue({
     generatedAt: '2026-02-27T00:00:00.000Z',
     sourceSeedPath: 'd1://leaderboard_rows',
+    freshness: {
+      schemaVersion: '2026-03-wave3',
+      source: 'server',
+      cacheVersion: '10:20',
+      latestSuccessfulRefreshRunId: 10,
+      latestSnapshotId: 20,
+      isStale: false,
+      staleReasons: [],
+      computedAt: '2026-03-03T00:00:00.000Z',
+    },
     entries: [],
   }),
   persistScanReport: vi.fn().mockResolvedValue(undefined),
@@ -107,6 +118,16 @@ describe('worker routes', () => {
     getLeaderboardArtifactMock.mockResolvedValue({
       generatedAt: '2026-02-27T00:00:00.000Z',
       sourceSeedPath: 'd1://leaderboard_rows',
+      freshness: {
+        schemaVersion: '2026-03-wave3',
+        source: 'server',
+        cacheVersion: '10:20',
+        latestSuccessfulRefreshRunId: 10,
+        latestSnapshotId: 20,
+        isStale: false,
+        staleReasons: [],
+        computedAt: '2026-03-03T00:00:00.000Z',
+      },
       entries: [],
     });
     persistScanReportMock.mockReset();
@@ -147,14 +168,44 @@ describe('worker routes', () => {
   it('serves leaderboard JSON', async () => {
     const response = await app.request('http://localhost/api/leaderboard');
     expect(response.status).toBe(200);
-    const body = (await response.json()) as { entries?: unknown[] };
+    const body = (await response.json()) as {
+      entries?: unknown[];
+      freshness?: {
+        source?: string;
+        cacheVersion?: string;
+        latestSnapshotId?: number;
+        latestSuccessfulRefreshRunId?: number;
+        schemaVersion?: string;
+        isStale?: boolean;
+        staleReasons?: string[];
+      };
+    };
     expect(Array.isArray(body.entries)).toBe(true);
+    expect(body.freshness?.schemaVersion).toBe('2026-03-wave3');
+    expect(body.freshness?.source).toBe('static-fallback');
+    expect(body.freshness?.cacheVersion).toBe('0:0');
+    expect(body.freshness?.latestSuccessfulRefreshRunId).toBe(0);
+    expect(body.freshness?.latestSnapshotId).toBe(0);
+    expect(body.freshness?.isStale).toBe(true);
+    expect(body.freshness?.staleReasons).toEqual(
+      expect.arrayContaining(['missing-snapshot-timestamp', 'cache-version-fallback']),
+    );
   });
 
   it('serves DB-backed leaderboard when D1 binding is available', async () => {
     getLeaderboardArtifactMock.mockResolvedValue({
       generatedAt: '2026-02-27T00:00:00.000Z',
       sourceSeedPath: 'd1://leaderboard_rows',
+      freshness: {
+        schemaVersion: '2026-03-wave3',
+        source: 'server',
+        cacheVersion: '44:501',
+        latestSuccessfulRefreshRunId: 44,
+        latestSnapshotId: 501,
+        isStale: false,
+        staleReasons: [],
+        computedAt: '2026-03-03T00:00:00.000Z',
+      },
       entries: [
         {
           rank: 1,
@@ -170,6 +221,17 @@ describe('worker routes', () => {
             strict: true,
             productionReady: true,
             notes: 'strict',
+          },
+          trust: {
+            anomalies: [],
+            verification: {
+              state: 'verified',
+              label: 'Verified Agent Output',
+              reason: 'AI readiness score 90 meets threshold.',
+              reasonCodes: ['eligible'],
+              readinessScore: 90,
+              threshold: 80,
+            },
           },
           thirtyDay: { equivalentEngineeringHours: 90, mergedPrs: 11, commitsPerDay: 3.2, activeCodingHours: 40 },
           totals: {
@@ -189,9 +251,19 @@ describe('worker routes', () => {
 
     const response = await app.request('http://localhost/api/leaderboard', undefined, { DB: {} as D1Database });
     expect(response.status).toBe(200);
-    const body = (await response.json()) as { entries: Array<{ percentile?: number; thirtyDay?: { mergedPrs?: number } }> };
+    const body = (await response.json()) as {
+      freshness?: { cacheVersion?: string; latestSnapshotId?: number };
+      entries: Array<{
+        percentile?: number;
+        thirtyDay?: { mergedPrs?: number };
+        trust?: { verification?: { state?: string } };
+      }>;
+    };
     expect(body.entries[0]?.percentile).toBe(100);
     expect(body.entries[0]?.thirtyDay?.mergedPrs).toBe(11);
+    expect(body.entries[0]?.trust?.verification?.state).toBe('verified');
+    expect(body.freshness?.cacheVersion).toBe('44:501');
+    expect(body.freshness?.latestSnapshotId).toBe(501);
     expect(ensureSeedDataMock).toHaveBeenCalled();
     expect(getLeaderboardArtifactMock).toHaveBeenCalled();
   });
@@ -203,6 +275,7 @@ describe('worker routes', () => {
     expect(response.status).toBe(200);
 
     const body = (await response.json()) as {
+      freshness?: { source?: string; cacheVersion?: string; isStale?: boolean; staleReasons?: string[] };
       dataSource?: { kind?: string; fallback?: boolean; healthy?: boolean; reason?: string; message?: string };
     };
     expect(body.dataSource?.kind).toBe('static-artifact');
@@ -210,6 +283,12 @@ describe('worker routes', () => {
     expect(body.dataSource?.healthy).toBe(false);
     expect(body.dataSource?.reason).toBe('d1-read-failure');
     expect(body.dataSource?.message).toContain('D1 exploded');
+    expect(body.freshness?.source).toBe('static-fallback');
+    expect(body.freshness?.cacheVersion).toBe('0:0');
+    expect(body.freshness?.isStale).toBe(true);
+    expect(body.freshness?.staleReasons).toEqual(
+      expect.arrayContaining(['missing-snapshot-timestamp', 'cache-version-fallback']),
+    );
   });
 
   it('returns 400 for invalid scan payload', async () => {
@@ -1721,6 +1800,17 @@ describe('worker routes', () => {
           productionReady: true,
           notes: 'strict',
         },
+        trust: {
+          anomalies: [],
+          verification: {
+            state: 'verified',
+            label: 'Verified Agent Output',
+            reason: 'AI readiness score 92 meets threshold.',
+            reasonCodes: ['eligible'],
+            readinessScore: 92,
+            threshold: 80,
+          },
+        },
         totals: {
           equivalentEngineeringHours: 120,
           mergedPrsUnverified: 12,
@@ -1734,6 +1824,26 @@ describe('worker routes', () => {
         repos: [],
       },
       history: [],
+      rivalry: {
+        rivalHandle: 'bob',
+        source: 'server',
+        capturedAt: '2026-02-27T00:00:00.000Z',
+        trend: 'closing',
+        rankDelta: 1,
+        equivalentEngineeringHoursDelta: 12,
+        currentGapEquivalentEngineeringHours: -8,
+        currentGapRank: -1,
+      },
+      freshness: {
+        schemaVersion: '2026-03-wave3',
+        source: 'server',
+        cacheVersion: '44:501',
+        latestSuccessfulRefreshRunId: 44,
+        latestSnapshotId: 501,
+        isStale: false,
+        staleReasons: [],
+        computedAt: '2026-03-03T00:00:00.000Z',
+      },
     });
 
     const profileResponse = await app.request('http://localhost/api/profile/alice', undefined, { DB: {} as D1Database });
@@ -1741,9 +1851,21 @@ describe('worker routes', () => {
 
     expect(profileResponse.status).toBe(200);
     expect(vResponse.status).toBe(200);
-    const body = (await profileResponse.json()) as { handle?: string; stackTier?: number };
+    const body = (await profileResponse.json()) as {
+      handle?: string;
+      stackTier?: number;
+      rivalry?: { source?: string; rivalHandle?: string };
+      freshness?: { cacheVersion?: string };
+      leaderboard?: { trust?: { verification?: { state?: string } } };
+    };
+    const vBody = (await vResponse.json()) as { freshness?: { cacheVersion?: string } };
     expect(body.handle).toBe('alice');
     expect(body.stackTier).toBe(2);
+    expect(body.rivalry?.source).toBe('server');
+    expect(body.rivalry?.rivalHandle).toBe('bob');
+    expect(body.leaderboard?.trust?.verification?.state).toBe('verified');
+    expect(body.freshness?.cacheVersion).toBe('44:501');
+    expect(vBody.freshness?.cacheVersion).toBe('44:501');
   });
 
   it('returns profile share badge SVG', async () => {

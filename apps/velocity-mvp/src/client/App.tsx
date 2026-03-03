@@ -1,7 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { fetchAuthIdentity, fetchLeaderboard, fetchProfile, logoutAuthSession, scanRepository } from './api';
 import type { AuthIdentity } from './api';
-import type { LeaderboardArtifact, LeaderboardEntry, ProfileResponse, RepoReportCard } from '../shared/types';
+import type {
+  LeaderboardArtifact,
+  LeaderboardEntry,
+  PayloadFreshness,
+  PayloadFreshnessStaleReasonCode,
+  ProfileResponse,
+  RepoReportCard,
+  TrustAnomalyFlag,
+  TrustAnomalySeverity,
+  VerifiedAgentOutputReasonCode,
+  VerifiedAgentOutputStatus,
+} from '../shared/types';
 
 type View = 'leaderboard' | 'scan';
 
@@ -257,6 +268,283 @@ export function resolveChallengeDeepLinkResolution(params: {
   return 'compare-ready';
 }
 
+interface FreshnessTimestampMarker {
+  label: string;
+  iso: string;
+}
+
+interface FreshnessPresentation {
+  headline: string;
+  detail: string;
+  timestamps: FreshnessTimestampMarker[];
+  note: string | null;
+  staleReasonCodes: PayloadFreshnessStaleReasonCode[];
+  staleReasonText: string[];
+  debugAttribution: string | null;
+  isStale: boolean;
+  tone: 'server' | 'fallback' | 'missing' | 'stale';
+}
+
+interface VerificationPresentation {
+  state: VerifiedAgentOutputStatus['state'];
+  label: string;
+  reason: string;
+  detail: string | null;
+  toneClass: string;
+}
+
+function isIsoTimestamp(value: string | undefined): value is string {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value));
+}
+
+function formatFreshnessTimestamp(iso: string): string {
+  if (!isIsoTimestamp(iso)) {
+    return 'timestamp unavailable';
+  }
+  return new Date(iso).toLocaleString();
+}
+
+export function compactReasonText(reason: string, maxLength = 120): string {
+  const normalized = reason.replace(/\s+/g, ' ').trim();
+  if (!normalized) {
+    return 'Reason unavailable.';
+  }
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+}
+
+export function summarizeAnomalies(
+  anomalies: TrustAnomalyFlag[] | null | undefined,
+  limit = 2,
+): { visible: TrustAnomalyFlag[]; remaining: number } {
+  if (!Array.isArray(anomalies) || anomalies.length === 0) {
+    return { visible: [], remaining: 0 };
+  }
+  const normalizedLimit = Math.max(0, Math.floor(limit));
+  const visible = anomalies.slice(0, normalizedLimit);
+  const remaining = Math.max(0, anomalies.length - visible.length);
+  return { visible, remaining };
+}
+
+function getAnomalySeverityToneClasses(severity: TrustAnomalySeverity): string {
+  if (severity === 'high') {
+    return 'border-rose-400/45 bg-rose-500/10 text-rose-100';
+  }
+  if (severity === 'medium') {
+    return 'border-amber-400/45 bg-amber-400/10 text-amber-100';
+  }
+  return 'border-sky-400/40 bg-sky-500/10 text-sky-100';
+}
+
+export function mapFreshnessStaleReasonCode(code: PayloadFreshnessStaleReasonCode): string {
+  if (code === 'missing-snapshot-timestamp') {
+    return 'Snapshot timestamp is missing.';
+  }
+  if (code === 'snapshot-too-old') {
+    return 'Snapshot age is outside the freshness window.';
+  }
+  return 'Cache version fallback is active.';
+}
+
+export function summarizeFreshnessStaleReasons(staleReasons: PayloadFreshnessStaleReasonCode[] | null | undefined): string[] {
+  if (!Array.isArray(staleReasons) || staleReasons.length === 0) {
+    return [];
+  }
+  const seen = new Set<PayloadFreshnessStaleReasonCode>();
+  const normalized: PayloadFreshnessStaleReasonCode[] = [];
+  for (const code of staleReasons) {
+    if (seen.has(code)) {
+      continue;
+    }
+    seen.add(code);
+    normalized.push(code);
+  }
+  return normalized.map((code) => mapFreshnessStaleReasonCode(code));
+}
+
+export function mapVerificationReasonCode(code: VerifiedAgentOutputReasonCode): string {
+  if (code === 'eligible') {
+    return 'All verification gates passed.';
+  }
+  if (code === 'readiness-missing') {
+    return 'Readiness score is missing.';
+  }
+  if (code === 'readiness-below-threshold') {
+    return 'Readiness score is below threshold.';
+  }
+  if (code === 'ci-coverage-unavailable') {
+    return 'CI coverage signal is unavailable.';
+  }
+  if (code === 'ci-coverage-below-threshold') {
+    return 'CI coverage is below threshold.';
+  }
+  return 'Snapshot freshness is stale.';
+}
+
+export function summarizeVerificationReasonCodes(reasonCodes: VerifiedAgentOutputReasonCode[] | undefined, limit = 2): string | null {
+  if (!Array.isArray(reasonCodes) || reasonCodes.length === 0) {
+    return null;
+  }
+  const seen = new Set<VerifiedAgentOutputReasonCode>();
+  const normalized: VerifiedAgentOutputReasonCode[] = [];
+  for (const code of reasonCodes) {
+    if (seen.has(code)) {
+      continue;
+    }
+    seen.add(code);
+    normalized.push(code);
+  }
+  if (normalized.length === 0) {
+    return null;
+  }
+  const normalizedLimit = Math.max(1, Math.floor(limit));
+  const visible = normalized.slice(0, normalizedLimit).map((code) => mapVerificationReasonCode(code));
+  const remaining = normalized.length - visible.length;
+  if (remaining > 0) {
+    return `${visible.join(' | ')} | +${remaining} more reason code(s).`;
+  }
+  return visible.join(' | ');
+}
+
+export function buildFreshnessPresentation(scope: 'Leaderboard' | 'Profile', freshness?: PayloadFreshness | null): FreshnessPresentation {
+  if (!freshness) {
+    return {
+      headline: `${scope} freshness unavailable`,
+      detail: 'Cache version, snapshot ID, and refresh metadata have not arrived yet.',
+      timestamps: [],
+      note: null,
+      staleReasonCodes: [],
+      staleReasonText: [],
+      debugAttribution: null,
+      isStale: false,
+      tone: 'missing',
+    };
+  }
+
+  const timestamps: FreshnessTimestampMarker[] = [];
+  if (isIsoTimestamp(freshness.latestSnapshotScannedAt)) {
+    timestamps.push({ label: 'Snapshot', iso: freshness.latestSnapshotScannedAt });
+  }
+  if (isIsoTimestamp(freshness.latestSuccessfulRefreshFinishedAt)) {
+    timestamps.push({ label: 'Refresh finished', iso: freshness.latestSuccessfulRefreshFinishedAt });
+  } else if (isIsoTimestamp(freshness.latestSuccessfulRefreshGeneratedAt)) {
+    timestamps.push({ label: 'Refresh generated', iso: freshness.latestSuccessfulRefreshGeneratedAt });
+  }
+
+  const sourceLabel = freshness.source === 'server' ? 'server-backed payload' : 'static fallback payload';
+  const staleReasonCodes = Array.isArray(freshness.staleReasons) ? freshness.staleReasons : [];
+  const staleReasonText = summarizeFreshnessStaleReasons(staleReasonCodes);
+  const isStale = freshness.isStale === true;
+  const schemaVersion = freshness.schemaVersion?.trim() ? freshness.schemaVersion : 'n/a';
+  const computedAt = freshness.computedAt ? formatFreshnessTimestamp(freshness.computedAt) : 'timestamp unavailable';
+  return {
+    headline: `${scope} freshness: ${sourceLabel}`,
+    detail: `cache ${freshness.cacheVersion} | snapshot #${freshness.latestSnapshotId} | refresh run #${freshness.latestSuccessfulRefreshRunId}`,
+    timestamps,
+    note: freshness.note ?? null,
+    staleReasonCodes,
+    staleReasonText,
+    debugAttribution: `schema ${schemaVersion} | computed ${computedAt}`,
+    isStale,
+    tone: isStale ? 'stale' : freshness.source === 'static-fallback' ? 'fallback' : 'server',
+  };
+}
+
+function getFreshnessToneClasses(tone: FreshnessPresentation['tone']): string {
+  if (tone === 'stale') {
+    return 'border-rose-400/45 bg-rose-500/10 text-rose-100';
+  }
+  if (tone === 'server') {
+    return 'border-emerald-400/35 bg-emerald-500/10 text-emerald-100';
+  }
+  if (tone === 'fallback') {
+    return 'border-amber-400/45 bg-amber-400/10 text-amber-100';
+  }
+  return 'border-slate-700 bg-surface-2 text-ink-2';
+}
+
+export function buildVerificationPresentation(verification?: VerifiedAgentOutputStatus | null): VerificationPresentation {
+  if (!verification) {
+    return {
+      state: 'unknown',
+      label: 'Verification Unknown',
+      reason: 'Verification payload is unavailable for this snapshot.',
+      detail: null,
+      toneClass: 'border-slate-700 bg-surface-2 text-ink-2',
+    };
+  }
+
+  const readinessThreshold =
+    typeof verification.readinessThreshold === 'number'
+      ? verification.readinessThreshold
+      : typeof verification.threshold === 'number'
+        ? verification.threshold
+        : null;
+  const readinessDetail =
+    typeof verification.readinessScore === 'number' && typeof readinessThreshold === 'number'
+      ? `Readiness ${formatNumber(verification.readinessScore, 1)} / ${formatNumber(readinessThreshold, 0)}+`
+      : null;
+  const coverageDetail =
+    typeof verification.ciCoverageRatio === 'number' && typeof verification.ciCoverageThreshold === 'number'
+      ? `CI coverage ${formatPercent(verification.ciCoverageRatio)} / ${formatPercent(verification.ciCoverageThreshold)}+`
+      : null;
+  const detail = [readinessDetail, coverageDetail].filter((value): value is string => Boolean(value)).join(' | ') || null;
+  const reasonFromCodes = summarizeVerificationReasonCodes(verification.reasonCodes, 2);
+  const reason = compactReasonText(reasonFromCodes ?? verification.reason, 132);
+
+  if (verification.state === 'verified') {
+    return {
+      state: verification.state,
+      label: verification.label,
+      reason,
+      detail,
+      toneClass: 'border-emerald-400/45 bg-emerald-500/10 text-emerald-100',
+    };
+  }
+  if (verification.state === 'pending') {
+    return {
+      state: verification.state,
+      label: verification.label,
+      reason,
+      detail,
+      toneClass: 'border-amber-400/45 bg-amber-400/10 text-amber-100',
+    };
+  }
+  return {
+    state: verification.state,
+    label: verification.label,
+    reason,
+    detail,
+    toneClass: 'border-slate-700 bg-surface-2 text-ink-2',
+  };
+}
+
+function buildRivalrySourceLabel(source: NonNullable<ProfileResponse['rivalry']>['source']): string {
+  if (source === 'server') {
+    return 'Source: server-backed rivalry payload';
+  }
+  return 'Source: fallback derived from profile history';
+}
+
+function buildRivalryTrendNarrative(
+  rivalHandle: string,
+  trend: NonNullable<ProfileResponse['rivalry']>['trend'],
+  hasChallengeLink: boolean,
+): string {
+  const challengeNudge = hasChallengeLink
+    ? `Challenge @${rivalHandle} now to lock in this momentum.`
+    : 'Sign in to generate a challenge link for this matchup.';
+  if (trend === 'closing') {
+    return `You are closing on @${rivalHandle}. ${challengeNudge}`;
+  }
+  if (trend === 'widening') {
+    return `@${rivalHandle} widened the gap in the latest snapshot. Ship a verified streak and answer back.`;
+  }
+  return `Gap is stable versus @${rivalHandle}. One strong scan-and-merge cycle can swing this rivalry.`;
+}
+
 function buildScanActionRecommendation(entry: LeaderboardEntry): { headline: string; detail: string } {
   if (entry.totals.mergedPrsUnverified > 0) {
     const ciCoverage = entry.totals.mergedPrsCiVerified / Math.max(1, entry.totals.mergedPrsUnverified);
@@ -464,6 +752,7 @@ export function App() {
   const challengeTelemetrySignatureRef = useRef<string>('');
   const rivalryTelemetrySignatureRef = useRef<string>('');
   const scanPersistenceSignatureRef = useRef<string>('');
+  const profileRefreshRequestIdRef = useRef(0);
   const shareFeedbackTimerRef = useRef<number | null>(null);
 
   const loadAuthState = useCallback(async () => {
@@ -519,9 +808,60 @@ export function App() {
   }, [refreshLeaderboardArtifact]);
 
   const routeProfileHandle = route.kind === 'profile' ? route.handle : null;
+  const refreshProfilePayload = useCallback(
+    async (handle: string, source: string, options: { clearExisting?: boolean } = {}) => {
+      const requestId = profileRefreshRequestIdRef.current + 1;
+      profileRefreshRequestIdRef.current = requestId;
+      const clearExisting = options.clearExisting === true;
+
+      setIsProfileLoading(true);
+      setProfileError(null);
+      if (clearExisting) {
+        setProfileData(null);
+      }
+
+      trackUxEvent('profile_refresh_requested', { source, handle });
+      try {
+        const profile = await fetchProfile(handle);
+        if (profileRefreshRequestIdRef.current !== requestId) {
+          return;
+        }
+        setProfileData(profile);
+        setProfileError(null);
+        trackUxEvent('profile_refresh_completed', { source, handle });
+      } catch (error) {
+        if (profileRefreshRequestIdRef.current !== requestId) {
+          return;
+        }
+        const message = (error as Error).message;
+        if (clearExisting) {
+          setProfileData(null);
+        }
+        setProfileError(message);
+        trackUxEvent('profile_refresh_failed', {
+          source,
+          handle,
+          reason: message,
+        });
+      } finally {
+        if (profileRefreshRequestIdRef.current === requestId) {
+          setIsProfileLoading(false);
+        }
+      }
+    },
+    [],
+  );
+  const recoverStaleProfileContext = useCallback(() => {
+    if (!routeProfileHandle) {
+      return;
+    }
+    void refreshProfilePayload(routeProfileHandle, 'profile-stale-recovery');
+    void refreshLeaderboardArtifact('profile-stale-recovery');
+  }, [refreshLeaderboardArtifact, refreshProfilePayload, routeProfileHandle]);
 
   useEffect(() => {
     if (!routeProfileHandle) {
+      profileRefreshRequestIdRef.current += 1;
       setProfileData(null);
       setProfileError(null);
       setIsProfileLoading(false);
@@ -529,38 +869,8 @@ export function App() {
       setProfileWeeklyStreak(1);
       return;
     }
-
-    let cancelled = false;
-    setIsProfileLoading(true);
-    setProfileError(null);
-    setProfileData(null);
-
-    fetchProfile(routeProfileHandle)
-      .then((profile) => {
-        if (cancelled) {
-          return;
-        }
-        setProfileData(profile);
-        setProfileError(null);
-      })
-      .catch((error) => {
-        if (cancelled) {
-          return;
-        }
-        setProfileData(null);
-        setProfileError((error as Error).message);
-      })
-      .finally(() => {
-        if (cancelled) {
-          return;
-        }
-        setIsProfileLoading(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [routeProfileHandle]);
+    void refreshProfilePayload(routeProfileHandle, 'route-profile-load', { clearExisting: true });
+  }, [refreshProfilePayload, routeProfileHandle]);
 
   useEffect(() => {
     const onPopState = () => {
@@ -1001,8 +1311,6 @@ export function App() {
     };
   }, [challengeTargetEntry, profileEntry]);
   const profileShareUrl = profileEntry ? buildProfileUrl(appOrigin, profileEntry.handle) : null;
-  const profileChallengeUrl =
-    profileEntry && profileRival && challengeActorHandle ? buildChallengeLink(appOrigin, challengeActorHandle, profileRival.handle) : null;
   const profileRivalEehDelta =
     profileEntry && profileRival ? profileEntry.totals.equivalentEngineeringHours - profileRival.totals.equivalentEngineeringHours : null;
   const scanComparisonEntry = useMemo(
@@ -1103,14 +1411,14 @@ export function App() {
       detail: 'Persistence backend was unavailable, so ranking impact was not recorded.',
     };
   }, [scanResult]);
-  const rivalryProgression = useMemo(() => {
-    if (!profileEntry || !profileRival) {
+  const rivalryProgression = useMemo<NonNullable<ProfileResponse['rivalry']> | null>(() => {
+    if (!profileEntry) {
       return null;
     }
     if (profileData?.rivalry) {
       return profileData.rivalry;
     }
-    if (!profileData || profileData.history.length < 2) {
+    if (!profileRival || !profileData || profileData.history.length < 2) {
       return null;
     }
     const latest = profileData.history[0];
@@ -1129,6 +1437,36 @@ export function App() {
       currentGapRank: profileRival.rank - profileEntry.rank,
     };
   }, [profileData, profileEntry, profileRival]);
+  const rivalryTargetHandle = rivalryProgression?.rivalHandle ?? profileRival?.handle ?? null;
+  const profileChallengeTargetHandle = rivalryTargetHandle;
+  const profileChallengeUrl =
+    profileEntry && challengeActorHandle && profileChallengeTargetHandle
+      ? buildChallengeLink(appOrigin, challengeActorHandle, profileChallengeTargetHandle)
+      : null;
+  const profileRivalrySourceLabel = rivalryProgression ? buildRivalrySourceLabel(rivalryProgression.source) : null;
+  const profileRivalryNarrative = rivalryProgression
+    ? buildRivalryTrendNarrative(rivalryProgression.rivalHandle, rivalryProgression.trend, Boolean(profileChallengeUrl))
+    : null;
+  const leaderboardFreshness = leaderboard?.freshness ?? null;
+  const leaderboardFreshnessPresentation = useMemo(
+    () => buildFreshnessPresentation('Leaderboard', leaderboardFreshness),
+    [leaderboardFreshness],
+  );
+  const profileFreshness = profileData?.freshness ?? leaderboardFreshness;
+  const profileFreshnessPresentation = useMemo(
+    () => buildFreshnessPresentation('Profile', profileFreshness),
+    [profileFreshness],
+  );
+  const profileFreshnessIsStale = profileFreshnessPresentation.isStale;
+  const profileFreshnessFallbackNote =
+    profileData?.freshness || !profileFreshness
+      ? null
+      : 'Profile freshness is temporarily using the leaderboard payload fallback.';
+  const profileVerificationPresentation = useMemo(
+    () => buildVerificationPresentation(profileEntry?.trust?.verification),
+    [profileEntry?.trust?.verification],
+  );
+  const profileAnomalySummary = useMemo(() => summarizeAnomalies(profileEntry?.trust?.anomalies, 4), [profileEntry?.trust?.anomalies]);
 
   useEffect(() => {
     if (route.kind !== 'profile') {
@@ -1338,7 +1676,7 @@ export function App() {
                       </button>
                     </>
                   ) : null}
-                  {profileChallengeUrl && profileRival ? (
+                  {profileChallengeUrl && profileChallengeTargetHandle ? (
                     <>
                       <button
                         className="min-h-11 rounded-lg border border-amber-400/50 bg-amber-400/10 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/20"
@@ -1347,15 +1685,15 @@ export function App() {
                             event: 'challenge_link_clicked',
                             source: 'profile_header',
                             challenger: currentActorHandleForTelemetry,
-                            target: profileRival.handle,
+                            target: profileChallengeTargetHandle,
                             title: 'Mentat Velocity Challenge',
-                            text: `I challenge @${profileRival.handle} on Mentat Velocity. Compare our trusted throughput.`,
+                            text: `I challenge @${profileChallengeTargetHandle} on Mentat Velocity. Compare our trusted throughput.`,
                             url: profileChallengeUrl,
                           })
                         }
                         type="button"
                       >
-                        Challenge @{profileRival.handle}
+                        Challenge @{profileChallengeTargetHandle}
                       </button>
                       <button
                         className="min-h-11 rounded-lg border border-amber-400/40 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/12"
@@ -1364,7 +1702,7 @@ export function App() {
                             event: 'challenge_link_clicked',
                             source: 'profile_header',
                             challenger: currentActorHandleForTelemetry,
-                            target: profileRival.handle,
+                            target: profileChallengeTargetHandle,
                             url: profileChallengeUrl,
                           })
                         }
@@ -1472,6 +1810,76 @@ export function App() {
                   )
                 ) : null}
                 <p className="mt-4 max-w-4xl rounded-lg border border-slate-700 bg-surface-2 px-3 py-2 text-xs leading-relaxed text-ink-2">{profileAttributionSummary}</p>
+                <div className={`mt-3 rounded-lg border p-3 text-xs ${getFreshnessToneClasses(profileFreshnessPresentation.tone)}`}>
+                  <p className="font-mono uppercase tracking-[0.08em]">{profileFreshnessPresentation.headline}</p>
+                  <p className="mt-1">{profileFreshnessPresentation.detail}</p>
+                  {profileFreshnessPresentation.timestamps.length > 0 ? (
+                    <p className="mt-1 font-mono">
+                      Latest:{' '}
+                      {profileFreshnessPresentation.timestamps
+                        .map((marker) => `${marker.label} ${formatFreshnessTimestamp(marker.iso)}`)
+                        .join(' | ')}
+                    </p>
+                  ) : (
+                    <p className="mt-1">Latest snapshot and refresh timestamps are not available in this payload.</p>
+                  )}
+                  {profileFreshnessFallbackNote ? <p className="mt-1">{profileFreshnessFallbackNote}</p> : null}
+                  {profileFreshnessPresentation.note ? <p className="mt-1">Note: {profileFreshnessPresentation.note}</p> : null}
+                  {profileFreshnessPresentation.isStale ? (
+                    <div className="mt-2 rounded-md border border-rose-300/60 bg-rose-500/15 p-2 text-rose-100">
+                      <p className="font-mono uppercase tracking-[0.08em]">Stale Snapshot Warning</p>
+                      <p className="mt-1">
+                        Profile progression may lag the latest backend state until a fresh snapshot is loaded.
+                      </p>
+                      {profileFreshnessPresentation.staleReasonText.length > 0 ? (
+                        <p className="mt-1">Reasons: {profileFreshnessPresentation.staleReasonText.join(' | ')}</p>
+                      ) : (
+                        <p className="mt-1">Reason codes were not provided by the payload.</p>
+                      )}
+                      <button
+                        className="mt-2 min-h-11 rounded-md border border-rose-300/70 bg-rose-400/20 px-3 py-2 font-mono text-[11px] text-rose-100 hover:bg-rose-400/30 disabled:opacity-60"
+                        disabled={isProfileLoading || isLeaderboardRefreshing}
+                        onClick={() => recoverStaleProfileContext()}
+                        type="button"
+                      >
+                        {isProfileLoading || isLeaderboardRefreshing ? 'Refreshing Context...' : 'Refresh Profile Context'}
+                      </button>
+                    </div>
+                  ) : null}
+                  {profileFreshnessPresentation.debugAttribution ? (
+                    <p className="mt-2 font-mono text-[11px] text-ink-2">Debug: {profileFreshnessPresentation.debugAttribution}</p>
+                  ) : null}
+                </div>
+                <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
+                  <div className={`rounded-lg border p-3 ${profileVerificationPresentation.toneClass}`}>
+                    <p className="font-mono text-xs uppercase tracking-[0.08em]">Verified Agent Output</p>
+                    <p className="mt-1 text-sm">{profileVerificationPresentation.label}</p>
+                    <p className="mt-1 text-xs">{profileVerificationPresentation.reason}</p>
+                    {profileVerificationPresentation.detail ? (
+                      <p className="mt-2 rounded border border-white/20 px-2 py-1 text-[11px]">{profileVerificationPresentation.detail}</p>
+                    ) : null}
+                  </div>
+                  <div className="rounded-lg border border-slate-700 bg-surface-2 p-3">
+                    <p className="font-mono text-xs uppercase tracking-[0.08em] text-ink-3">Anomaly Flags</p>
+                    {profileAnomalySummary.visible.length > 0 ? (
+                      <div className="mt-2 space-y-2">
+                        {profileAnomalySummary.visible.map((flag) => (
+                          <div key={`${flag.key}-${flag.reason}`} className={`rounded border px-2 py-1 text-xs ${getAnomalySeverityToneClasses(flag.severity)}`}>
+                            <p className="font-mono uppercase tracking-[0.08em]">
+                              Severity {flag.severity.toUpperCase()} | {flag.label}
+                            </p>
+                            <p className="mt-1">{compactReasonText(flag.reason, 116)}</p>
+                          </div>
+                        ))}
+                        {profileAnomalySummary.remaining > 0 ? (
+                          <p className="text-xs text-ink-3">+{profileAnomalySummary.remaining} more anomaly flag(s) in payload.</p>
+                        ) : null}
+                      </div>
+                    ) : (
+                      <p className="mt-2 text-xs text-ink-2">No anomaly flags in the latest trust payload.</p>
+                    )}
+                  </div>
+                </div>
                 {profileScanAction ? (
                   <div className="mt-3 rounded-lg border border-cyan-400/40 bg-cyan-500/10 p-3">
                     <p className="font-mono text-xs uppercase tracking-[0.08em] text-cyan-100">Velocity to Scan Action Loop</p>
@@ -1567,35 +1975,52 @@ export function App() {
                     ) : null}
                   </div>
                   <div className="rounded-lg border border-cyan-400/40 bg-cyan-500/10 p-3 lg:col-span-3">
-                    <p className="font-mono text-xs uppercase tracking-[0.08em] text-cyan-100">Rivalry Progression (Server-Backed)</p>
+                    <p className="font-mono text-xs uppercase tracking-[0.08em] text-cyan-100">Rivalry Progression</p>
                     {rivalryProgression ? (
                       <>
-                        <p className="mt-1 text-sm text-cyan-100">
-                          vs @{rivalryProgression.rivalHandle}:{' '}
-                          {rivalryProgression.trend === 'closing'
-                            ? 'you are closing the gap.'
-                            : rivalryProgression.trend === 'widening'
-                              ? 'the gap widened in the latest snapshot.'
-                              : 'gap unchanged in the latest snapshot.'}
-                        </p>
+                        <p className="mt-1 text-sm text-cyan-100">{profileRivalryNarrative}</p>
+                        {profileFreshnessIsStale ? (
+                          <div className="mt-2 rounded border border-amber-300/60 bg-amber-400/20 px-2 py-2 text-xs text-amber-100">
+                            <p className="font-mono uppercase tracking-[0.08em]">Potentially Stale Rivalry Context</p>
+                            <p className="mt-1">Progression swing may be outdated. Refresh profile context to validate latest rank and EEH gaps.</p>
+                            <button
+                              className="mt-2 min-h-11 rounded-md border border-amber-300/70 bg-amber-400/20 px-3 py-2 font-mono text-[11px] text-amber-100 hover:bg-amber-400/30 disabled:opacity-60"
+                              disabled={isProfileLoading || isLeaderboardRefreshing}
+                              onClick={() => recoverStaleProfileContext()}
+                              type="button"
+                            >
+                              {isProfileLoading || isLeaderboardRefreshing ? 'Refreshing Context...' : 'Refresh Rivalry Context'}
+                            </button>
+                          </div>
+                        ) : null}
                         <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-3">
                           <p className="rounded border border-cyan-300/40 px-2 py-1 text-xs text-cyan-100">
-                            Rank delta {formatSignedDelta(rivalryProgression.rankDelta, 0)}
+                            Rank swing {formatSignedDelta(rivalryProgression.rankDelta, 0)}
                           </p>
                           <p className="rounded border border-cyan-300/40 px-2 py-1 text-xs text-cyan-100">
-                            EEH delta {formatSignedDelta(rivalryProgression.equivalentEngineeringHoursDelta, 1)}
+                            EEH swing {formatSignedDelta(rivalryProgression.equivalentEngineeringHoursDelta, 1)}
                           </p>
                           <p className="rounded border border-cyan-300/40 px-2 py-1 text-xs text-cyan-100">
                             Current EEH gap {formatSignedDelta(rivalryProgression.currentGapEquivalentEngineeringHours, 1)}
                           </p>
                         </div>
                         <p className="mt-2 font-mono text-xs text-cyan-200">
-                          Source: {rivalryProgression.source} at {new Date(rivalryProgression.capturedAt).toLocaleString()}
+                          {profileRivalrySourceLabel} | Captured {new Date(rivalryProgression.capturedAt).toLocaleString()}
                         </p>
+                        {rivalryProgression.source === 'history-derived' ? (
+                          <p className="mt-1 text-xs text-cyan-100/85">
+                            Server rivalry data is missing, so this view is using a local history fallback.
+                          </p>
+                        ) : null}
+                        {profileChallengeUrl && profileChallengeTargetHandle ? (
+                          <p className="mt-1 text-xs text-cyan-100/85">
+                            Challenge/share nudge: use the "Challenge @{profileChallengeTargetHandle}" action above to publish this matchup.
+                          </p>
+                        ) : null}
                       </>
                     ) : (
                       <p className="mt-1 text-sm text-cyan-100">
-                        Rivalry progression unavailable until at least two profile history snapshots are persisted.
+                        Server rivalry payload is not available yet. Fallback needs at least two profile history snapshots to render progression.
                       </p>
                     )}
                   </div>
@@ -1986,6 +2411,45 @@ export function App() {
                   <p className="mb-4 rounded-md border border-slate-700 bg-surface-2 px-3 py-2 text-xs text-ink-2">
                     Methodology: EEH and ranking use CI-verified merged PRs on the default branch; unverified merged PR totals are shown for transparency.
                   </p>
+                  <div className={`mb-4 rounded-md border px-3 py-2 text-xs ${getFreshnessToneClasses(leaderboardFreshnessPresentation.tone)}`}>
+                    <p className="font-mono uppercase tracking-[0.08em]">{leaderboardFreshnessPresentation.headline}</p>
+                    <p className="mt-1">{leaderboardFreshnessPresentation.detail}</p>
+                    {leaderboardFreshnessPresentation.timestamps.length > 0 ? (
+                      <p className="mt-1 font-mono">
+                        Latest:{' '}
+                        {leaderboardFreshnessPresentation.timestamps
+                          .map((marker) => `${marker.label} ${formatFreshnessTimestamp(marker.iso)}`)
+                          .join(' | ')}
+                      </p>
+                    ) : (
+                      <p className="mt-1">Latest snapshot and refresh timestamps are not available in this payload.</p>
+                    )}
+                    {leaderboardFreshnessPresentation.note ? <p className="mt-1">Note: {leaderboardFreshnessPresentation.note}</p> : null}
+                    {leaderboardFreshnessPresentation.isStale ? (
+                      <div className="mt-2 rounded-md border border-rose-300/60 bg-rose-500/15 p-2 text-rose-100">
+                        <p className="font-mono uppercase tracking-[0.08em]">Stale Snapshot Warning</p>
+                        <p className="mt-1">Leaderboard positions may be outdated until a fresh backend snapshot is fetched.</p>
+                        {leaderboardFreshnessPresentation.staleReasonText.length > 0 ? (
+                          <p className="mt-1">Reasons: {leaderboardFreshnessPresentation.staleReasonText.join(' | ')}</p>
+                        ) : (
+                          <p className="mt-1">Reason codes were not provided by the payload.</p>
+                        )}
+                        <button
+                          className="mt-2 min-h-11 rounded-md border border-rose-300/70 bg-rose-400/20 px-3 py-2 font-mono text-[11px] text-rose-100 hover:bg-rose-400/30 disabled:opacity-60"
+                          disabled={isLeaderboardRefreshing}
+                          onClick={() => {
+                            void refreshLeaderboardArtifact('leaderboard-stale-recovery');
+                          }}
+                          type="button"
+                        >
+                          {isLeaderboardRefreshing ? 'Refreshing Snapshot...' : 'Refresh Snapshot Now'}
+                        </button>
+                      </div>
+                    ) : null}
+                    {leaderboardFreshnessPresentation.debugAttribution ? (
+                      <p className="mt-2 font-mono text-[11px] text-ink-2">Debug: {leaderboardFreshnessPresentation.debugAttribution}</p>
+                    ) : null}
+                  </div>
                   {leaderboardError ? <p className="text-sm text-state-danger">{leaderboardError}</p> : null}
                   <div className="mb-3 grid gap-3 sm:hidden">
                     {!leaderboardError && !leaderboard ? (
@@ -1999,6 +2463,8 @@ export function App() {
                     {sortedEntries.map((entry) => {
                       const percentile = getPercentile(entry, sortedEntries.length);
                       const scanAction = buildScanActionRecommendation(entry);
+                      const verificationPresentation = buildVerificationPresentation(entry.trust?.verification);
+                      const anomalySummary = summarizeAnomalies(entry.trust?.anomalies, 1);
                       const nextHigher = sortedEntries.find((candidate) => candidate.rank === entry.rank - 1) ?? null;
                       const eehGapToNext = nextHigher ? nextHigher.totals.equivalentEngineeringHours - entry.totals.equivalentEngineeringHours : null;
                       const shareEntryUrl = buildProfileUrl(appOrigin, entry.handle);
@@ -2046,6 +2512,25 @@ export function App() {
                           <p className="mt-2 rounded border border-cyan-400/35 bg-cyan-500/10 px-2 py-1 text-xs text-cyan-100">
                             {formatNextFixDetail(entry.scanInsight ?? scanAction.detail)}
                           </p>
+                          <div className={`mt-2 rounded border px-2 py-1 text-xs ${verificationPresentation.toneClass}`}>
+                            <p className="font-mono uppercase tracking-[0.08em]">{verificationPresentation.label}</p>
+                            <p className="mt-1">{compactReasonText(verificationPresentation.reason, 96)}</p>
+                          </div>
+                          {anomalySummary.visible.length > 0 ? (
+                            <div className="mt-2 space-y-1">
+                              {anomalySummary.visible.map((flag) => (
+                                <div key={`${entry.handle}-${flag.key}`} className={`rounded border px-2 py-1 text-xs ${getAnomalySeverityToneClasses(flag.severity)}`}>
+                                  <p className="font-mono uppercase tracking-[0.08em]">
+                                    Severity {flag.severity.toUpperCase()} | {flag.label}
+                                  </p>
+                                  <p className="mt-1">{compactReasonText(flag.reason, 88)}</p>
+                                </div>
+                              ))}
+                              {anomalySummary.remaining > 0 ? (
+                                <p className="text-xs text-ink-3">+{anomalySummary.remaining} additional anomaly flag(s)</p>
+                              ) : null}
+                            </div>
+                          ) : null}
                           <div className="mt-3 flex items-center gap-2">
                             {entry.featuredRepo ? (
                               <button
@@ -2161,109 +2646,136 @@ export function App() {
                             </td>
                           </tr>
                         ) : null}
-                        {sortedEntries.map((entry) => (
-                          <tr key={entry.handle} className="border-b border-slate-800/80 transition-colors hover:bg-surface-2">
-                            <td className="px-2 py-3 font-mono text-accent-2">#{entry.rank}</td>
-                            <td className="px-2 py-3">
-                              <button className="font-medium hover:text-accent-2" onClick={() => openProfile(entry.handle)} type="button">
-                                @{entry.handle}
-                              </button>
-                              <p className="font-mono text-xs text-ink-3">{entry.scannedRepos} repo(s) scanned</p>
-                              {entry.aiReadyScore === undefined ? (
-                                <p className="font-mono text-xs text-ink-3">AI-Ready: trust-labeled pending Scan payload</p>
-                              ) : (
-                                <p className="font-mono text-xs text-ink-3">AI-Ready: {entry.aiReadyScore}%</p>
-                              )}
-                              <p className="font-mono text-xs text-ink-3">{entry.scanInsight ?? buildScanActionRecommendation(entry).detail}</p>
-                              <div className="mt-2 flex flex-wrap gap-2">
-                                {entry.featuredRepo ? (
-                                  <button
-                                    className="min-h-11 rounded border border-emerald-400/50 bg-emerald-500/10 px-3 py-2 font-mono text-[11px] text-emerald-100 hover:bg-emerald-500/20"
-                                    onClick={() => startScanFromRepo(entry.featuredRepo!, 'leaderboard_table_row')}
-                                    type="button"
-                                  >
-                                    Run Scan
-                                  </button>
+                        {sortedEntries.map((entry) => {
+                          const verificationPresentation = buildVerificationPresentation(entry.trust?.verification);
+                          const anomalySummary = summarizeAnomalies(entry.trust?.anomalies, 2);
+
+                          return (
+                            <tr key={entry.handle} className="border-b border-slate-800/80 transition-colors hover:bg-surface-2">
+                              <td className="px-2 py-3 font-mono text-accent-2">#{entry.rank}</td>
+                              <td className="px-2 py-3">
+                                <button className="font-medium hover:text-accent-2" onClick={() => openProfile(entry.handle)} type="button">
+                                  @{entry.handle}
+                                </button>
+                                <p className="font-mono text-xs text-ink-3">{entry.scannedRepos} repo(s) scanned</p>
+                                {entry.aiReadyScore === undefined ? (
+                                  <p className="font-mono text-xs text-ink-3">AI-Ready: trust-labeled pending Scan payload</p>
+                                ) : (
+                                  <p className="font-mono text-xs text-ink-3">AI-Ready: {entry.aiReadyScore}%</p>
+                                )}
+                                <p className="font-mono text-xs text-ink-3">{entry.scanInsight ?? buildScanActionRecommendation(entry).detail}</p>
+                                <div className={`mt-2 rounded border px-2 py-1 text-xs ${verificationPresentation.toneClass}`}>
+                                  <p className="font-mono uppercase tracking-[0.08em]">{verificationPresentation.label}</p>
+                                  <p className="mt-1">{compactReasonText(verificationPresentation.reason, 106)}</p>
+                                </div>
+                                {anomalySummary.visible.length > 0 ? (
+                                  <div className="mt-2 space-y-1">
+                                    {anomalySummary.visible.map((flag) => (
+                                      <div
+                                        key={`${entry.handle}-${flag.key}-${flag.reason}`}
+                                        className={`rounded border px-2 py-1 text-xs ${getAnomalySeverityToneClasses(flag.severity)}`}
+                                      >
+                                        <p className="font-mono uppercase tracking-[0.08em]">
+                                          Severity {flag.severity.toUpperCase()} | {flag.label}
+                                        </p>
+                                        <p className="mt-1">{compactReasonText(flag.reason, 96)}</p>
+                                      </div>
+                                    ))}
+                                    {anomalySummary.remaining > 0 ? (
+                                      <p className="text-xs text-ink-3">+{anomalySummary.remaining} additional anomaly flag(s)</p>
+                                    ) : null}
+                                  </div>
                                 ) : null}
-                                <button
-                                  className="min-h-11 rounded border border-cyan-400/50 bg-cyan-500/10 px-3 py-2 font-mono text-[11px] text-cyan-100 hover:bg-cyan-500/20"
-                                  onClick={() =>
-                                    void triggerOutboundShare({
-                                      event: 'profile_share_clicked',
-                                      source: 'leaderboard_table_row',
-                                      handle: entry.handle,
-                                      title: 'Mentat Velocity Profile',
-                                      text: `Mentat Velocity profile check: @${entry.handle} is currently #${entry.rank}.`,
-                                      url: buildProfileUrl(appOrigin, entry.handle),
-                                    })
-                                  }
-                                  type="button"
-                                >
-                                  Share
-                                </button>
-                                <button
-                                  className="min-h-11 rounded border border-cyan-400/40 px-3 py-2 font-mono text-[11px] text-cyan-100 hover:bg-cyan-500/15"
-                                  onClick={() =>
-                                    void copyShareLink({
-                                      event: 'profile_share_clicked',
-                                      source: 'leaderboard_table_row',
-                                      handle: entry.handle,
-                                      url: buildProfileUrl(appOrigin, entry.handle),
-                                    })
-                                  }
-                                  type="button"
-                                >
-                                  Copy
-                                </button>
-                                {challengeActorHandle && entry.handle !== normalizedActorHandle ? (
+                                <div className="mt-2 flex flex-wrap gap-2">
+                                  {entry.featuredRepo ? (
+                                    <button
+                                      className="min-h-11 rounded border border-emerald-400/50 bg-emerald-500/10 px-3 py-2 font-mono text-[11px] text-emerald-100 hover:bg-emerald-500/20"
+                                      onClick={() => startScanFromRepo(entry.featuredRepo!, 'leaderboard_table_row')}
+                                      type="button"
+                                    >
+                                      Run Scan
+                                    </button>
+                                  ) : null}
                                   <button
-                                    className="min-h-11 rounded border border-amber-400/50 bg-amber-400/10 px-3 py-2 font-mono text-[11px] text-amber-100 hover:bg-amber-400/20"
+                                    className="min-h-11 rounded border border-cyan-400/50 bg-cyan-500/10 px-3 py-2 font-mono text-[11px] text-cyan-100 hover:bg-cyan-500/20"
                                     onClick={() =>
                                       void triggerOutboundShare({
-                                        event: 'challenge_link_clicked',
+                                        event: 'profile_share_clicked',
                                         source: 'leaderboard_table_row',
-                                        challenger: currentActorHandleForTelemetry,
-                                        target: entry.handle,
-                                        title: 'Mentat Velocity Challenge',
-                                        text: `I challenge @${entry.handle} on Mentat Velocity.`,
-                                        url: buildChallengeLink(appOrigin, challengeActorHandle, entry.handle) ?? buildProfileUrl(appOrigin, entry.handle),
+                                        handle: entry.handle,
+                                        title: 'Mentat Velocity Profile',
+                                        text: `Mentat Velocity profile check: @${entry.handle} is currently #${entry.rank}.`,
+                                        url: buildProfileUrl(appOrigin, entry.handle),
                                       })
                                     }
                                     type="button"
                                   >
-                                    Challenge
+                                    Share
                                   </button>
-                                ) : (
-                                  <a
-                                    className="min-h-11 inline-flex items-center rounded border border-amber-400/40 px-3 py-2 font-mono text-[11px] text-amber-100 hover:bg-amber-400/10"
-                                    href="/api/auth/github/start"
-                                    onClick={() => trackUxEvent('claim_profile_clicked', { source: 'leaderboard_table_row_challenge_gate', signedIn: false })}
+                                  <button
+                                    className="min-h-11 rounded border border-cyan-400/40 px-3 py-2 font-mono text-[11px] text-cyan-100 hover:bg-cyan-500/15"
+                                    onClick={() =>
+                                      void copyShareLink({
+                                        event: 'profile_share_clicked',
+                                        source: 'leaderboard_table_row',
+                                        handle: entry.handle,
+                                        url: buildProfileUrl(appOrigin, entry.handle),
+                                      })
+                                    }
+                                    type="button"
                                   >
-                                    Claim to Challenge
+                                    Copy
+                                  </button>
+                                  {challengeActorHandle && entry.handle !== normalizedActorHandle ? (
+                                    <button
+                                      className="min-h-11 rounded border border-amber-400/50 bg-amber-400/10 px-3 py-2 font-mono text-[11px] text-amber-100 hover:bg-amber-400/20"
+                                      onClick={() =>
+                                        void triggerOutboundShare({
+                                          event: 'challenge_link_clicked',
+                                          source: 'leaderboard_table_row',
+                                          challenger: currentActorHandleForTelemetry,
+                                          target: entry.handle,
+                                          title: 'Mentat Velocity Challenge',
+                                          text: `I challenge @${entry.handle} on Mentat Velocity.`,
+                                          url: buildChallengeLink(appOrigin, challengeActorHandle, entry.handle) ?? buildProfileUrl(appOrigin, entry.handle),
+                                        })
+                                      }
+                                      type="button"
+                                    >
+                                      Challenge
+                                    </button>
+                                  ) : (
+                                    <a
+                                      className="min-h-11 inline-flex items-center rounded border border-amber-400/40 px-3 py-2 font-mono text-[11px] text-amber-100 hover:bg-amber-400/10"
+                                      href="/api/auth/github/start"
+                                      onClick={() => trackUxEvent('claim_profile_clicked', { source: 'leaderboard_table_row_challenge_gate', signedIn: false })}
+                                    >
+                                      Claim to Challenge
+                                    </a>
+                                  )}
+                                </div>
+                              </td>
+                              <td className="px-2 py-3">
+                                {entry.featuredRepo ? (
+                                  <a href={entry.featuredRepo} className="text-xs text-ink-2 hover:text-accent-2 hover:underline" rel="noreferrer" target="_blank">
+                                    {entry.featuredRepo.replace('https://github.com/', '')}
                                   </a>
+                                ) : (
+                                  <span className="text-xs text-ink-3">-</span>
                                 )}
-                              </div>
-                            </td>
-                            <td className="px-2 py-3">
-                              {entry.featuredRepo ? (
-                                <a href={entry.featuredRepo} className="text-xs text-ink-2 hover:text-accent-2 hover:underline" rel="noreferrer" target="_blank">
-                                  {entry.featuredRepo.replace('https://github.com/', '')}
-                                </a>
-                              ) : (
-                                <span className="text-xs text-ink-3">-</span>
-                              )}
-                            </td>
-                            <td className="px-2 py-3 font-mono">{formatNumber(entry.totals.equivalentEngineeringHours, 1)}</td>
-                            <td className="px-2 py-3 font-mono">{formatNumber(entry.totals.mergedPrsCiVerified, 0)}</td>
-                            <td className="px-2 py-3 font-mono text-ink-3">{formatNumber(entry.totals.mergedPrsUnverified, 0)}</td>
-                            <td className="px-2 py-3 font-mono">{formatNumber(entry.totals.commitsPerDay)}</td>
-                            <td className="px-2 py-3 font-mono">{formatNumber(entry.totals.activeCodingHours, 0)}</td>
-                            <td className="px-2 py-3 font-mono">{formatPercent(entry.totals.offHoursRatio)}</td>
-                            <td className={`px-2 py-3 font-mono ${entry.totals.velocityAcceleration >= 0 ? 'text-state-success' : 'text-state-warning'}`}>
-                              {formatAcceleration(entry.totals.velocityAcceleration)}
-                            </td>
-                          </tr>
-                        ))}
+                              </td>
+                              <td className="px-2 py-3 font-mono">{formatNumber(entry.totals.equivalentEngineeringHours, 1)}</td>
+                              <td className="px-2 py-3 font-mono">{formatNumber(entry.totals.mergedPrsCiVerified, 0)}</td>
+                              <td className="px-2 py-3 font-mono text-ink-3">{formatNumber(entry.totals.mergedPrsUnverified, 0)}</td>
+                              <td className="px-2 py-3 font-mono">{formatNumber(entry.totals.commitsPerDay)}</td>
+                              <td className="px-2 py-3 font-mono">{formatNumber(entry.totals.activeCodingHours, 0)}</td>
+                              <td className="px-2 py-3 font-mono">{formatPercent(entry.totals.offHoursRatio)}</td>
+                              <td className={`px-2 py-3 font-mono ${entry.totals.velocityAcceleration >= 0 ? 'text-state-success' : 'text-state-warning'}`}>
+                                {formatAcceleration(entry.totals.velocityAcceleration)}
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>

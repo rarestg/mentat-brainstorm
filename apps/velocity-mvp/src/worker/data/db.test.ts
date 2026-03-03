@@ -85,6 +85,21 @@ function makeHeatmapCounts(seed = 0): number[][] {
   );
 }
 
+function hoursAgoIso(hoursAgo: number): string {
+  return new Date(Date.now() - hoursAgo * 60 * 60 * 1000).toISOString();
+}
+
+function makeFreshnessRow(overrides?: Partial<Record<string, unknown>>): Record<string, unknown> {
+  return {
+    latest_refresh_run_id: 44,
+    latest_refresh_generated_at: hoursAgoIso(2),
+    latest_refresh_finished_at: hoursAgoIso(1),
+    latest_snapshot_id: 501,
+    latest_snapshot_scanned_at: hoursAgoIso(1),
+    ...overrides,
+  };
+}
+
 describe('persistScanReport', () => {
   it('recomputes leaderboard rows for first and repeat scans without rank=0 writes', async () => {
     const runCalls: SqlCall[] = [];
@@ -291,6 +306,18 @@ describe('getLeaderboardArtifact', () => {
     expect(artifact.entries[0]?.provenance?.profile.trendPoints.state).toBe('unavailable');
     expect(artifact.entries[0]?.provenance?.profile.throughputHeatmap.state).toBe('unavailable');
     expect(artifact.entries[0]?.provenance?.profile.rotatingInsights.state).toBe('authoritative');
+    expect(artifact.entries[0]?.trust?.verification.state).toBe('pending');
+    expect(artifact.entries[0]?.trust?.verification.reasonCodes).toContain('readiness-missing');
+    expect(artifact.entries[0]?.trust?.anomalies).toEqual([]);
+    expect(artifact.freshness?.schemaVersion).toBe('2026-03-wave3');
+    expect(artifact.freshness?.cacheVersion).toBe('0:0');
+    expect(artifact.freshness?.latestSuccessfulRefreshRunId).toBe(0);
+    expect(artifact.freshness?.latestSnapshotId).toBe(0);
+    expect(artifact.freshness?.isStale).toBe(true);
+    expect(artifact.freshness?.staleReasons).toEqual(
+      expect.arrayContaining(['missing-snapshot-timestamp', 'cache-version-fallback']),
+    );
+    expect(typeof artifact.freshness?.computedAt).toBe('string');
     expect(Array.isArray(artifact.entries[0]?.profile?.rotatingInsights)).toBe(true);
   });
 
@@ -303,7 +330,7 @@ describe('getLeaderboardArtifact', () => {
         leaderboard_updated_at: '2026-03-01T00:00:00.000Z',
         scanned_repos: 2,
         featured_repo: 'https://github.com/zeus/app',
-        ai_ready_score: null,
+        ai_ready_score: 91,
         scan_insight: null,
         total_equivalent_engineering_hours: 210,
         total_merged_prs_unverified: 22,
@@ -330,7 +357,10 @@ describe('getLeaderboardArtifact', () => {
           async onRun() {
             return { success: true, meta: { last_row_id: 0 } };
           },
-          async onFirst() {
+          async onFirst(currentSql) {
+            if (currentSql.includes('latest_refresh_run_id')) {
+              return makeFreshnessRow();
+            }
             return null;
           },
           async onAll(currentSql) {
@@ -387,7 +417,164 @@ describe('getLeaderboardArtifact', () => {
     expect(entry?.provenance?.profile.trendPoints.state).toBe('authoritative');
     expect(entry?.provenance?.profile.throughputHeatmap.state).toBe('authoritative');
     expect(entry?.provenance?.profile.rotatingInsights.state).toBe('authoritative');
+    expect(entry?.trust?.verification.state).toBe('verified');
+    expect(entry?.trust?.verification.reasonCodes).toEqual(['eligible']);
+    expect(entry?.trust?.verification.readinessScore).toBe(91);
+    expect(entry?.trust?.verification.ciCoverageRatio).toBe(0.82);
     expect(entry?.profile?.rotatingInsights?.length).toBeGreaterThan(0);
+    expect(artifact.freshness?.isStale).toBe(false);
+  });
+
+  it('marks freshness stale for aged snapshots and blocks verification eligibility', async () => {
+    const rows = [
+      {
+        user_id: 9,
+        handle: 'odin',
+        rank: 1,
+        leaderboard_updated_at: hoursAgoIso(2),
+        scanned_repos: 1,
+        featured_repo: null,
+        ai_ready_score: 92,
+        scan_insight: null,
+        total_equivalent_engineering_hours: 140,
+        total_merged_prs_unverified: 12,
+        total_merged_prs_ci_verified: 10,
+        total_merged_prs: 10,
+        total_commits_per_day: 4.4,
+        total_active_coding_hours: 52,
+        total_off_hours_ratio: 0.2,
+        total_velocity_acceleration: 0.4,
+        attribution_mode: 'handle-authored',
+        attribution_source: 'github-author-login-match',
+        attribution_target_handle: 'odin',
+        attribution_strict: 1,
+        t30_equivalent_engineering_hours: 120,
+        t30_merged_prs: 9,
+        t30_commits_per_day: 4.0,
+        t30_active_coding_hours: 48,
+      },
+    ];
+
+    const db = {
+      prepare(sql: string) {
+        return createPreparedStatement(sql, {
+          async onRun() {
+            return { success: true, meta: { last_row_id: 0 } };
+          },
+          async onFirst(currentSql) {
+            if (currentSql.includes('latest_refresh_run_id')) {
+              return makeFreshnessRow({
+                latest_refresh_run_id: 12,
+                latest_snapshot_id: 300,
+                latest_snapshot_scanned_at: hoursAgoIso(96),
+              });
+            }
+            return null;
+          },
+          async onAll(currentSql) {
+            if (currentSql.includes('FROM leaderboard_rows lr')) {
+              return { success: true, results: rows };
+            }
+            if (currentSql.includes('FROM crowns c')) {
+              return { success: true, results: [] };
+            }
+            return { success: true, results: [] };
+          },
+        });
+      },
+      batch() {
+        return Promise.resolve([]) as Promise<D1Result<unknown>[]>;
+      },
+      exec() {
+        return Promise.resolve({ count: 0, duration: 0 }) as Promise<D1ExecResult>;
+      },
+      dump() {
+        return Promise.resolve(new ArrayBuffer(0));
+      },
+    } as unknown as D1Database;
+
+    const artifact = await getLeaderboardArtifact(db);
+    const verification = artifact.entries[0]?.trust?.verification;
+    expect(artifact.freshness?.isStale).toBe(true);
+    expect(artifact.freshness?.staleReasons).toContain('snapshot-too-old');
+    expect(artifact.freshness?.staleReasons).not.toContain('cache-version-fallback');
+    expect(verification?.state).toBe('pending');
+    expect(verification?.reasonCodes).toEqual(['freshness-stale']);
+  });
+
+  it('adds CI coverage reason code when coverage is below the verification policy threshold', async () => {
+    const rows = [
+      {
+        user_id: 15,
+        handle: 'thor',
+        rank: 1,
+        leaderboard_updated_at: hoursAgoIso(2),
+        scanned_repos: 1,
+        featured_repo: null,
+        ai_ready_score: 90,
+        scan_insight: null,
+        total_equivalent_engineering_hours: 130,
+        total_merged_prs_unverified: 10,
+        total_merged_prs_ci_verified: 4,
+        total_merged_prs: 4,
+        total_commits_per_day: 3.6,
+        total_active_coding_hours: 42,
+        total_off_hours_ratio: 0.25,
+        total_velocity_acceleration: 0.3,
+        attribution_mode: 'handle-authored',
+        attribution_source: 'github-author-login-match',
+        attribution_target_handle: 'thor',
+        attribution_strict: 1,
+        t30_equivalent_engineering_hours: 130,
+        t30_merged_prs: 4,
+        t30_commits_per_day: 3.6,
+        t30_active_coding_hours: 42,
+      },
+    ];
+
+    const db = {
+      prepare(sql: string) {
+        return createPreparedStatement(sql, {
+          async onRun() {
+            return { success: true, meta: { last_row_id: 0 } };
+          },
+          async onFirst(currentSql) {
+            if (currentSql.includes('latest_refresh_run_id')) {
+              return makeFreshnessRow();
+            }
+            return null;
+          },
+          async onAll(currentSql) {
+            if (currentSql.includes('FROM leaderboard_rows lr')) {
+              return { success: true, results: rows };
+            }
+            if (currentSql.includes('FROM crowns c')) {
+              return { success: true, results: [] };
+            }
+            return { success: true, results: [] };
+          },
+        });
+      },
+      batch() {
+        return Promise.resolve([]) as Promise<D1Result<unknown>[]>;
+      },
+      exec() {
+        return Promise.resolve({ count: 0, duration: 0 }) as Promise<D1ExecResult>;
+      },
+      dump() {
+        return Promise.resolve(new ArrayBuffer(0));
+      },
+    } as unknown as D1Database;
+
+    const artifact = await getLeaderboardArtifact(db);
+    const verification = artifact.entries[0]?.trust?.verification;
+    expect(artifact.freshness?.isStale).toBe(false);
+    expect(verification?.state).toBe('pending');
+    expect(verification?.reasonCodes).toContain('ci-coverage-below-threshold');
+    expect(verification?.reasonCodes).not.toContain('readiness-below-threshold');
+    expect(verification?.reasonCodes).not.toContain('freshness-stale');
+    expect(verification?.ciCoverageRatio).toBe(0.4);
+    expect(verification?.ciCoverageThreshold).toBe(0.7);
   });
 });
 
@@ -480,5 +667,151 @@ describe('getProfileByHandle', () => {
     expect(profile?.leaderboard.provenance?.profile.throughputHeatmap.state).toBe('unavailable');
     expect(profile?.leaderboard.provenance?.profile.throughputHeatmap.reason).toBe('no-scan-history');
     expect(profile?.leaderboard.provenance?.profile.rotatingInsights.state).toBe('authoritative');
+    expect(profile?.freshness?.isStale).toBe(true);
+    expect(profile?.freshness?.staleReasons).toEqual(
+      expect.arrayContaining(['missing-snapshot-timestamp', 'cache-version-fallback']),
+    );
+    expect(profile?.leaderboard.trust?.verification.state).toBe('pending');
+    expect(profile?.leaderboard.trust?.verification.reasonCodes).toEqual(
+      expect.arrayContaining(['readiness-missing', 'freshness-stale']),
+    );
+  });
+
+  it('hydrates server rivalry progression and freshness metadata when rival history exists', async () => {
+    const db = {
+      prepare(sql: string) {
+        return createPreparedStatement(sql, {
+          async onRun() {
+            return { success: true, meta: { last_row_id: 0 } };
+          },
+          async onFirst(currentSql) {
+            if (currentSql.includes('FROM users u') && currentSql.includes('INNER JOIN leaderboard_rows lr')) {
+              return {
+                user_id: 3,
+                handle: 'hera',
+                rank: 2,
+                leaderboard_updated_at: '2026-03-01T00:00:00.000Z',
+                scanned_repos: 1,
+                featured_repo: 'https://github.com/hera/app',
+                ai_ready_score: 84,
+                scan_insight: null,
+                total_equivalent_engineering_hours: 120,
+                total_merged_prs_unverified: 12,
+                total_merged_prs_ci_verified: 10,
+                total_merged_prs: 10,
+                total_commits_per_day: 3.1,
+                total_active_coding_hours: 40,
+                total_off_hours_ratio: 0.2,
+                total_velocity_acceleration: 0.1,
+                attribution_mode: 'repo-wide',
+                attribution_source: 'github-author-login-match',
+                attribution_target_handle: null,
+                attribution_strict: 0,
+                t30_equivalent_engineering_hours: 80,
+                t30_merged_prs: 6,
+                t30_commits_per_day: 2.7,
+                t30_active_coding_hours: 33,
+                total_rows: 5,
+              };
+            }
+            if (currentSql.includes('ABS(lr.rank - ?)')) {
+              return {
+                user_id: 7,
+                handle: 'zeus',
+                rank: 1,
+                total_equivalent_engineering_hours: 150,
+                leaderboard_updated_at: '2026-03-01T00:00:00.000Z',
+              };
+            }
+            if (currentSql.includes('latest_refresh_run_id')) {
+              return makeFreshnessRow({
+                latest_refresh_run_id: 44,
+                latest_snapshot_id: 501,
+              });
+            }
+            return null;
+          },
+          async onAll(currentSql, params) {
+            if (currentSql.includes('FROM crowns')) {
+              return { success: true, results: [] };
+            }
+            if (currentSql.includes('FROM profile_metrics_history') && currentSql.includes('LIMIT 30')) {
+              return {
+                success: true,
+                results: [
+                  {
+                    captured_at: '2026-03-01T00:00:00.000Z',
+                    rank: 2,
+                    percentile: 80,
+                    stack_tier: 2,
+                    equivalent_engineering_hours: 120,
+                    merged_prs: 10,
+                    commits_per_day: 3.1,
+                    active_coding_hours: 40,
+                  },
+                  {
+                    captured_at: '2026-02-01T00:00:00.000Z',
+                    rank: 3,
+                    percentile: 70,
+                    stack_tier: 2,
+                    equivalent_engineering_hours: 100,
+                    merged_prs: 8,
+                    commits_per_day: 2.6,
+                    active_coding_hours: 35,
+                  },
+                ],
+              };
+            }
+            if (currentSql.includes('FROM profile_metrics_history') && currentSql.includes('LIMIT 2')) {
+              if (params[0] === 7) {
+                return {
+                  success: true,
+                  results: [
+                    {
+                      captured_at: '2026-03-01T00:00:00.000Z',
+                      rank: 1,
+                      equivalent_engineering_hours: 150,
+                    },
+                    {
+                      captured_at: '2026-02-01T00:00:00.000Z',
+                      rank: 1,
+                      equivalent_engineering_hours: 140,
+                    },
+                  ],
+                };
+              }
+            }
+            if (currentSql.includes('WITH latest_repo_scans AS')) {
+              return { success: true, results: [] };
+            }
+            return { success: true, results: [] };
+          },
+        });
+      },
+      batch() {
+        return Promise.resolve([]) as Promise<D1Result<unknown>[]>;
+      },
+      exec() {
+        return Promise.resolve({ count: 0, duration: 0 }) as Promise<D1ExecResult>;
+      },
+      dump() {
+        return Promise.resolve(new ArrayBuffer(0));
+      },
+    } as unknown as D1Database;
+
+    const profile = await getProfileByHandle(db, 'hera');
+    expect(profile).not.toBeNull();
+    expect(profile?.rivalry?.source).toBe('server');
+    expect(profile?.rivalry?.rivalHandle).toBe('zeus');
+    expect(profile?.rivalry?.trend).toBe('closing');
+    expect(profile?.rivalry?.rankDelta).toBe(1);
+    expect(profile?.rivalry?.equivalentEngineeringHoursDelta).toBe(20);
+    expect(profile?.rivalry?.currentGapEquivalentEngineeringHours).toBe(-30);
+    expect(profile?.rivalry?.currentGapRank).toBe(-1);
+    expect(profile?.freshness?.schemaVersion).toBe('2026-03-wave3');
+    expect(profile?.freshness?.cacheVersion).toBe('44:501');
+    expect(profile?.freshness?.isStale).toBe(false);
+    expect(profile?.leaderboard.trust?.verification.state).toBe('verified');
+    expect(profile?.leaderboard.trust?.verification.reasonCodes).toEqual(['eligible']);
   });
 });

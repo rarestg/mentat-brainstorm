@@ -6,8 +6,9 @@ import seedCreators from '../../data/seed-creators.json';
 import { deleteCachedByPrefix, getCached, setCached } from '../shared/cache';
 import { exchangeGitHubOAuthCode, fetchGitHubAuthenticatedUser } from '../shared/github';
 import { scanRepoByUrl } from '../shared/scanService';
-import type { LeaderboardArtifact, ProfileResponse, ScanRequest, SeedCreator } from '../shared/types';
+import type { LeaderboardArtifact, PayloadFreshness, ProfileResponse, ScanRequest, SeedCreator } from '../shared/types';
 import {
+  WAVE3_CONTRACT_SCHEMA_VERSION,
   buildBadgeSvg,
   createSessionRecord,
   ensureSeedData,
@@ -394,6 +395,21 @@ function createPublicCacheVersionToken(refreshVersion: number, canonicalScanVers
   const boundedRefreshVersion = Math.max(0, Math.floor(refreshVersion));
   const boundedScanVersion = Math.max(0, Math.floor(canonicalScanVersion));
   return `${boundedRefreshVersion}:${boundedScanVersion}`;
+}
+
+function buildStaticFallbackFreshness(note: string): PayloadFreshness {
+  const computedAt = new Date().toISOString();
+  return {
+    schemaVersion: WAVE3_CONTRACT_SCHEMA_VERSION,
+    source: 'static-fallback',
+    cacheVersion: createPublicCacheVersionToken(0, 0),
+    latestSuccessfulRefreshRunId: 0,
+    latestSnapshotId: 0,
+    isStale: true,
+    staleReasons: ['missing-snapshot-timestamp', 'cache-version-fallback'],
+    computedAt,
+    note,
+  };
 }
 
 function buildEdgeCacheRequest(requestUrl: string, cacheVersion: PublicCacheVersionToken): Request {
@@ -940,6 +956,7 @@ app.get('/api/leaderboard', async (c) => {
     return applyPublicCacheHeaders(
       c.json({
         ...(leaderboardArtifact as LeaderboardArtifact),
+        freshness: buildStaticFallbackFreshness('db-binding-missing'),
         dataSource: {
           kind: 'static-artifact',
           fallback: true,
@@ -979,6 +996,7 @@ app.get('/api/leaderboard', async (c) => {
     return c.json(
       {
         ...(leaderboardArtifact as LeaderboardArtifact),
+        freshness: buildStaticFallbackFreshness('d1-read-failure'),
         dataSource: {
           kind: 'static-artifact',
           fallback: true,

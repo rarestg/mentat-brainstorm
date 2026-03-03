@@ -9,7 +9,7 @@ vi.mock('../../shared/leaderboard', () => ({
 }));
 
 import { buildLeaderboard } from '../../shared/leaderboard';
-import { getLeaderboardArtifact, persistLeaderboardArtifact, persistScanReport, refreshLeaderboardFromSeed } from './db';
+import { getLeaderboardArtifact, getProfileByHandle, persistLeaderboardArtifact, persistScanReport, refreshLeaderboardFromSeed } from './db';
 
 const buildLeaderboardMock = vi.mocked(buildLeaderboard);
 
@@ -70,7 +70,7 @@ function reportFixture(overrides?: Partial<RepoReportCard>): RepoReportCard {
       name: 'project',
       url: 'https://github.com/alice/project',
     },
-    scannedAt: '2026-02-28T12:00:00.000Z',
+    scannedAt: new Date().toISOString(),
     attribution: {
       mode: 'repo-wide',
       source: 'github-author-login-match',
@@ -881,5 +881,113 @@ describe('worker data integration (local D1)', () => {
       activeCodingHours: 22,
     });
     expect(alice?.provenance?.thirtyDay.source).toBe('d1:snapshots.current30d.latest-per-repo');
+  });
+
+  it('Wave3 contract: exposes freshness metadata, trust signals, and server-backed rivalry progression', async () => {
+    const aliceRoundOne = seededEntryWithRepo('alice', 100);
+    const bobRoundOne = seededEntryWithRepo('bob', 140);
+    const aliceRoundTwo = seededEntryWithRepo('alice', 120);
+    const bobRoundTwo = seededEntryWithRepo('bob', 150);
+
+    await persistLeaderboardArtifact(db, {
+      generatedAt: '2026-02-20T00:00:00.000Z',
+      sourceSeedPath: 'data/seed-creators.json',
+      entries: [
+        {
+          ...aliceRoundOne,
+          rank: 2,
+          aiReadyScore: 86,
+          totals: {
+            ...aliceRoundOne.totals,
+            equivalentEngineeringHours: 100,
+            mergedPrsUnverified: 12,
+            mergedPrsCiVerified: 10,
+            mergedPrs: 10,
+            commitsPerDay: 6,
+            activeCodingHours: 48,
+            offHoursRatio: 0.45,
+            velocityAcceleration: 0.3,
+          },
+        },
+        {
+          ...bobRoundOne,
+          rank: 1,
+          aiReadyScore: 74,
+          totals: {
+            ...bobRoundOne.totals,
+            equivalentEngineeringHours: 140,
+            mergedPrsUnverified: 14,
+            mergedPrsCiVerified: 13,
+            mergedPrs: 13,
+            commitsPerDay: 7,
+            activeCodingHours: 54,
+            offHoursRatio: 0.3,
+            velocityAcceleration: 0.35,
+          },
+        },
+      ],
+    });
+
+    await persistLeaderboardArtifact(db, {
+      generatedAt: '2026-03-01T00:00:00.000Z',
+      sourceSeedPath: 'data/seed-creators.json',
+      entries: [
+        {
+          ...aliceRoundTwo,
+          rank: 2,
+          aiReadyScore: 86,
+          totals: {
+            ...aliceRoundTwo.totals,
+            equivalentEngineeringHours: 120,
+            mergedPrsUnverified: 20,
+            mergedPrsCiVerified: 2,
+            mergedPrs: 2,
+            commitsPerDay: 28,
+            activeCodingHours: 62,
+            offHoursRatio: 0.82,
+            velocityAcceleration: 0.7,
+          },
+        },
+        {
+          ...bobRoundTwo,
+          rank: 1,
+          aiReadyScore: 74,
+          totals: {
+            ...bobRoundTwo.totals,
+            equivalentEngineeringHours: 150,
+            mergedPrsUnverified: 15,
+            mergedPrsCiVerified: 14,
+            mergedPrs: 14,
+            commitsPerDay: 8,
+            activeCodingHours: 56,
+            offHoursRatio: 0.34,
+            velocityAcceleration: 0.38,
+          },
+        },
+      ],
+    });
+
+    const leaderboard = await getLeaderboardArtifact(db);
+    const aliceEntry = leaderboard.entries.find((entry) => entry.handle === 'alice');
+    const bobEntry = leaderboard.entries.find((entry) => entry.handle === 'bob');
+    expect(leaderboard.freshness?.schemaVersion).toBe('2026-03-wave3');
+    expect(leaderboard.freshness?.cacheVersion).toMatch(/^\d+:\d+$/);
+    expect(leaderboard.freshness?.latestSnapshotId).toBeGreaterThan(0);
+    expect(leaderboard.freshness?.isStale).toBe(false);
+    expect(leaderboard.freshness?.staleReasons).toEqual([]);
+    expect(aliceEntry?.trust?.verification.state).toBe('pending');
+    expect(aliceEntry?.trust?.verification.reasonCodes).toContain('ci-coverage-below-threshold');
+    expect(bobEntry?.trust?.verification.reasonCodes).toContain('readiness-below-threshold');
+    expect((aliceEntry?.trust?.anomalies ?? []).map((flag) => flag.key)).toEqual(
+      expect.arrayContaining(['ci-coverage-low', 'off-hours-dominant', 'commit-throughput-outlier']),
+    );
+
+    const aliceProfile = await getProfileByHandle(db, 'alice');
+    expect(aliceProfile?.freshness?.cacheVersion).toBe(leaderboard.freshness?.cacheVersion);
+    expect(aliceProfile?.leaderboard.trust?.verification.reasonCodes).toContain('ci-coverage-below-threshold');
+    expect(aliceProfile?.rivalry?.source).toBe('server');
+    expect(aliceProfile?.rivalry?.rivalHandle).toBe('bob');
+    expect(aliceProfile?.rivalry?.trend).toBe('closing');
+    expect(aliceProfile?.rivalry?.currentGapEquivalentEngineeringHours).toBe(-30);
   });
 });

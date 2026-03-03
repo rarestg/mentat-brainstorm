@@ -3,12 +3,17 @@ import type {
   LeaderboardArtifact,
   LeaderboardEntry,
   LeaderboardEntryProvenance,
+  LeaderboardEntryTrustSignals,
   MetricBlockProvenance,
+  PayloadFreshness,
+  PayloadFreshnessStaleReasonCode,
   ProfileCrown,
   ProfileMetricsHistoryPoint,
+  ProfileRivalryProgression,
   ProfileResponse,
   RepoReportCard,
   SeedCreator,
+  VerifiedAgentOutputReasonCode,
 } from '../../shared/types';
 import { buildLeaderboard } from '../../shared/leaderboard';
 import { detectInitialStackCrowns, inferOperatingStackTier, stackTierLabel } from './stack';
@@ -48,6 +53,18 @@ const THROUGHPUT_HEATMAP_SOURCE = 'd1:scans.windows_json.current30d.throughputHe
 const TREND_POINTS_SOURCE = 'd1:profile_metrics_history';
 const ROTATING_INSIGHTS_SOURCE = 'derived:d1:leaderboard_rows+d1:profile_metrics_history';
 const THIRTY_DAY_SOURCE = 'd1:snapshots.current30d.latest-per-repo';
+export const WAVE3_CONTRACT_SCHEMA_VERSION = '2026-03-wave3';
+export const FRESHNESS_STALE_SNAPSHOT_MAX_AGE_HOURS = 72;
+const FRESHNESS_STALE_SNAPSHOT_MAX_AGE_MS = FRESHNESS_STALE_SNAPSHOT_MAX_AGE_HOURS * 60 * 60 * 1000;
+const FRESHNESS_CACHE_VERSION_FALLBACK_TOKEN = '0:0';
+export const VERIFIED_AGENT_OUTPUT_READINESS_THRESHOLD = 80;
+export const VERIFIED_AGENT_OUTPUT_MIN_CI_COVERAGE_THRESHOLD = 0.7;
+const ANOMALY_CI_COVERAGE_THRESHOLD = 0.6;
+const ANOMALY_OFF_HOURS_RATIO_THRESHOLD = 0.75;
+const ANOMALY_HIGH_COMMITS_PER_DAY_THRESHOLD = 25;
+const ANOMALY_LOW_CI_MERGED_PRS_THRESHOLD = 2;
+const RIVALRY_DISTANCE_RANK_WEIGHT = 100;
+const RIVALRY_TREND_STABILITY_EPSILON = 0.5;
 
 function createEmptyHeatmapCounts(): number[][] {
   return Array.from({ length: HEATMAP_DAYS }, () => Array.from({ length: HEATMAP_HOURS }, () => 0));
@@ -147,6 +164,306 @@ function formatRatioPercent(value: number): string {
 function formatSignedPercent(value: number): string {
   const rounded = round2(value * 100);
   return `${rounded >= 0 ? '+' : ''}${rounded}%`;
+}
+
+function buildCacheVersionToken(refreshRunId: number, snapshotId: number): string {
+  return `${Math.max(0, Math.floor(refreshRunId))}:${Math.max(0, Math.floor(snapshotId))}`;
+}
+
+function buildPayloadFreshness(input: {
+  source: PayloadFreshness['source'];
+  latestSuccessfulRefreshRunId: number;
+  latestSnapshotId: number;
+  latestSuccessfulRefreshGeneratedAt?: string;
+  latestSuccessfulRefreshFinishedAt?: string;
+  latestSnapshotScannedAt?: string;
+  note?: string;
+  computedAt?: string;
+}): PayloadFreshness {
+  const latestSuccessfulRefreshRunId = Math.max(0, Math.floor(input.latestSuccessfulRefreshRunId));
+  const latestSnapshotId = Math.max(0, Math.floor(input.latestSnapshotId));
+  const cacheVersion = buildCacheVersionToken(latestSuccessfulRefreshRunId, latestSnapshotId);
+  const computedAt = isIsoTimestamp(toStringValue(input.computedAt)) ? toStringValue(input.computedAt) : new Date().toISOString();
+  const staleReasons: PayloadFreshnessStaleReasonCode[] = [];
+
+  if (!input.latestSnapshotScannedAt) {
+    staleReasons.push('missing-snapshot-timestamp');
+  } else {
+    const snapshotAgeMs = Date.parse(computedAt) - Date.parse(input.latestSnapshotScannedAt);
+    if (Number.isFinite(snapshotAgeMs) && snapshotAgeMs > FRESHNESS_STALE_SNAPSHOT_MAX_AGE_MS) {
+      staleReasons.push('snapshot-too-old');
+    }
+  }
+
+  if (cacheVersion === FRESHNESS_CACHE_VERSION_FALLBACK_TOKEN) {
+    staleReasons.push('cache-version-fallback');
+  }
+
+  return {
+    schemaVersion: WAVE3_CONTRACT_SCHEMA_VERSION,
+    source: input.source,
+    cacheVersion,
+    latestSuccessfulRefreshRunId,
+    latestSnapshotId,
+    latestSuccessfulRefreshGeneratedAt: input.latestSuccessfulRefreshGeneratedAt,
+    latestSuccessfulRefreshFinishedAt: input.latestSuccessfulRefreshFinishedAt,
+    latestSnapshotScannedAt: input.latestSnapshotScannedAt,
+    isStale: staleReasons.length > 0,
+    staleReasons,
+    computedAt,
+    note: input.note,
+  };
+}
+
+function buildFallbackFreshness(note?: string): PayloadFreshness {
+  return buildPayloadFreshness({
+    source: 'server',
+    latestSuccessfulRefreshRunId: 0,
+    latestSnapshotId: 0,
+    note,
+  });
+}
+
+interface PayloadFreshnessSqlRow {
+  latest_refresh_run_id: number;
+  latest_refresh_generated_at: string | null;
+  latest_refresh_finished_at: string | null;
+  latest_snapshot_id: number;
+  latest_snapshot_scanned_at: string | null;
+}
+
+async function loadPayloadFreshness(db: D1Database): Promise<PayloadFreshness> {
+  try {
+    const row = await db
+      .prepare(
+        `SELECT
+           COALESCE((SELECT id FROM refresh_runs WHERE status = 'success' ORDER BY id DESC LIMIT 1), 0) AS latest_refresh_run_id,
+           (SELECT generated_at FROM refresh_runs WHERE status = 'success' ORDER BY id DESC LIMIT 1) AS latest_refresh_generated_at,
+           (SELECT finished_at FROM refresh_runs WHERE status = 'success' ORDER BY id DESC LIMIT 1) AS latest_refresh_finished_at,
+           COALESCE((SELECT id FROM snapshots ORDER BY id DESC LIMIT 1), 0) AS latest_snapshot_id,
+           (SELECT scanned_at FROM snapshots ORDER BY id DESC LIMIT 1) AS latest_snapshot_scanned_at`,
+      )
+      .first<PayloadFreshnessSqlRow>();
+
+    const latestSuccessfulRefreshRunId = Math.max(0, toNumber(row?.latest_refresh_run_id, 0));
+    const latestSnapshotId = Math.max(0, toNumber(row?.latest_snapshot_id, 0));
+    const latestSuccessfulRefreshGeneratedAt = isIsoTimestamp(toStringValue(row?.latest_refresh_generated_at))
+      ? toStringValue(row?.latest_refresh_generated_at)
+      : undefined;
+    const latestSuccessfulRefreshFinishedAt = isIsoTimestamp(toStringValue(row?.latest_refresh_finished_at))
+      ? toStringValue(row?.latest_refresh_finished_at)
+      : undefined;
+    const latestSnapshotScannedAt = isIsoTimestamp(toStringValue(row?.latest_snapshot_scanned_at))
+      ? toStringValue(row?.latest_snapshot_scanned_at)
+      : undefined;
+
+    return buildPayloadFreshness({
+      source: 'server',
+      latestSuccessfulRefreshRunId,
+      latestSnapshotId,
+      latestSuccessfulRefreshGeneratedAt,
+      latestSuccessfulRefreshFinishedAt,
+      latestSnapshotScannedAt,
+    });
+  } catch {
+    return buildFallbackFreshness('freshness-query-failed');
+  }
+}
+
+interface TrustTotals {
+  mergedPrsUnverified: number;
+  mergedPrsCiVerified: number;
+  mergedPrs: number;
+  commitsPerDay: number;
+  activeCodingHours: number;
+  offHoursRatio: number;
+}
+
+function computeCiCoverageRatio(totals: TrustTotals): number | undefined {
+  if (totals.mergedPrsUnverified > 0) {
+    return Math.min(1, Math.max(0, totals.mergedPrsCiVerified / totals.mergedPrsUnverified));
+  }
+  if (totals.mergedPrsCiVerified > 0) {
+    return 1;
+  }
+  return undefined;
+}
+
+function buildVerificationReason(params: {
+  reasonCodes: VerifiedAgentOutputReasonCode[];
+  readinessScore?: number;
+  ciCoverageRatio?: number;
+  freshness: PayloadFreshness;
+}): string {
+  const { reasonCodes, readinessScore, ciCoverageRatio, freshness } = params;
+  if (reasonCodes.includes('eligible')) {
+    return `Eligible: readiness >= ${VERIFIED_AGENT_OUTPUT_READINESS_THRESHOLD}, CI-verified coverage >= ${Math.round(VERIFIED_AGENT_OUTPUT_MIN_CI_COVERAGE_THRESHOLD * 100)}%, and freshness is not stale.`;
+  }
+
+  const reasons: string[] = [];
+  if (reasonCodes.includes('readiness-missing')) {
+    reasons.push('AI readiness score is unavailable.');
+  } else if (reasonCodes.includes('readiness-below-threshold')) {
+    reasons.push(
+      `AI readiness score ${round2(readinessScore ?? 0)} is below ${VERIFIED_AGENT_OUTPUT_READINESS_THRESHOLD}.`,
+    );
+  }
+
+  if (reasonCodes.includes('ci-coverage-unavailable')) {
+    reasons.push('CI-verified merge coverage is unavailable.');
+  } else if (reasonCodes.includes('ci-coverage-below-threshold')) {
+    reasons.push(
+      `CI-verified merge coverage ${formatRatioPercent(ciCoverageRatio ?? 0)} is below ${Math.round(VERIFIED_AGENT_OUTPUT_MIN_CI_COVERAGE_THRESHOLD * 100)}%.`,
+    );
+  }
+
+  if (reasonCodes.includes('freshness-stale')) {
+    const staleReasons = freshness.staleReasons ?? [];
+    reasons.push(`Freshness is stale (${staleReasons.length > 0 ? staleReasons.join(', ') : 'unspecified'}).`);
+  }
+
+  if (reasons.length === 0) {
+    return 'Verification prerequisites are incomplete.';
+  }
+  return reasons.join(' ');
+}
+
+function buildTrustSignals(params: {
+  totals: TrustTotals;
+  aiReadyScore?: number;
+  freshness: PayloadFreshness;
+}): LeaderboardEntryTrustSignals {
+  const { totals, aiReadyScore, freshness } = params;
+  const anomalies: LeaderboardEntryTrustSignals['anomalies'] = [];
+
+  if (totals.mergedPrsUnverified > 0) {
+    const ciCoverageRatio = totals.mergedPrsCiVerified / Math.max(1, totals.mergedPrsUnverified);
+    if (ciCoverageRatio < ANOMALY_CI_COVERAGE_THRESHOLD) {
+      anomalies.push({
+        key: 'ci-coverage-low',
+        label: 'Low CI Verification Coverage',
+        severity: ciCoverageRatio < 0.4 ? 'high' : 'medium',
+        reason: `CI-verified merge coverage is ${formatRatioPercent(ciCoverageRatio)} (${totals.mergedPrsCiVerified}/${totals.mergedPrsUnverified}), below the ${Math.round(ANOMALY_CI_COVERAGE_THRESHOLD * 100)}% trust threshold.`,
+      });
+    }
+  }
+
+  if (totals.offHoursRatio >= ANOMALY_OFF_HOURS_RATIO_THRESHOLD && totals.activeCodingHours >= 12) {
+    anomalies.push({
+      key: 'off-hours-dominant',
+      label: 'Off-Hours Dominant Output',
+      severity: 'medium',
+      reason: `Off-hours ratio is ${formatRatioPercent(totals.offHoursRatio)} across ${round2(totals.activeCodingHours)} active coding hours.`,
+    });
+  }
+
+  if (
+    totals.commitsPerDay >= ANOMALY_HIGH_COMMITS_PER_DAY_THRESHOLD &&
+    totals.mergedPrsCiVerified <= ANOMALY_LOW_CI_MERGED_PRS_THRESHOLD
+  ) {
+    anomalies.push({
+      key: 'commit-throughput-outlier',
+      label: 'Commit Throughput Outlier',
+      severity: 'high',
+      reason: `Commits/day is ${round2(totals.commitsPerDay)} while CI-verified merged PRs are ${totals.mergedPrsCiVerified}, indicating low trusted conversion.`,
+    });
+  }
+
+  const normalizedReadinessScore =
+    typeof aiReadyScore === 'number' && Number.isFinite(aiReadyScore) ? round2(Math.max(0, aiReadyScore)) : undefined;
+  const ciCoverageRatio = computeCiCoverageRatio(totals);
+  const reasonCodes: VerifiedAgentOutputReasonCode[] = [];
+
+  if (typeof normalizedReadinessScore !== 'number') {
+    reasonCodes.push('readiness-missing');
+  } else if (normalizedReadinessScore < VERIFIED_AGENT_OUTPUT_READINESS_THRESHOLD) {
+    reasonCodes.push('readiness-below-threshold');
+  }
+
+  if (typeof ciCoverageRatio !== 'number') {
+    reasonCodes.push('ci-coverage-unavailable');
+  } else if (ciCoverageRatio < VERIFIED_AGENT_OUTPUT_MIN_CI_COVERAGE_THRESHOLD) {
+    reasonCodes.push('ci-coverage-below-threshold');
+  }
+
+  if (freshness.isStale) {
+    reasonCodes.push('freshness-stale');
+  }
+
+  if (reasonCodes.length === 0) {
+    reasonCodes.push('eligible');
+  }
+
+  const hasThroughputSignal = totals.mergedPrsUnverified > 0 || totals.mergedPrsCiVerified > 0;
+  const state =
+    reasonCodes.length === 1 && reasonCodes[0] === 'eligible'
+      ? 'verified'
+      : !hasThroughputSignal && typeof normalizedReadinessScore !== 'number'
+        ? 'unknown'
+        : 'pending';
+
+  return {
+    anomalies,
+    verification: {
+      state,
+      label:
+        state === 'verified'
+          ? 'Verified Agent Output'
+          : state === 'unknown'
+            ? 'Verification Unknown'
+            : 'Verification Pending',
+      reason: buildVerificationReason({
+        reasonCodes,
+        readinessScore: normalizedReadinessScore,
+        ciCoverageRatio,
+        freshness,
+      }),
+      reasonCodes,
+      readinessScore: normalizedReadinessScore,
+      readinessThreshold: VERIFIED_AGENT_OUTPUT_READINESS_THRESHOLD,
+      ciCoverageRatio: typeof ciCoverageRatio === 'number' ? round2(ciCoverageRatio) : undefined,
+      ciCoverageThreshold: VERIFIED_AGENT_OUTPUT_MIN_CI_COVERAGE_THRESHOLD,
+      threshold: VERIFIED_AGENT_OUTPUT_READINESS_THRESHOLD,
+    },
+  };
+}
+
+function resolveRivalryTrend(params: {
+  currentGapRank: number;
+  currentGapEquivalentEngineeringHours: number;
+  previousGapRank?: number;
+  previousGapEquivalentEngineeringHours?: number;
+  rankDelta: number;
+  equivalentEngineeringHoursDelta: number;
+}): ProfileRivalryProgression['trend'] {
+  if (
+    typeof params.previousGapRank === 'number' &&
+    typeof params.previousGapEquivalentEngineeringHours === 'number' &&
+    Number.isFinite(params.previousGapRank) &&
+    Number.isFinite(params.previousGapEquivalentEngineeringHours)
+  ) {
+    const currentDistance =
+      Math.abs(params.currentGapRank) * RIVALRY_DISTANCE_RANK_WEIGHT + Math.abs(params.currentGapEquivalentEngineeringHours);
+    const previousDistance =
+      Math.abs(params.previousGapRank) * RIVALRY_DISTANCE_RANK_WEIGHT + Math.abs(params.previousGapEquivalentEngineeringHours);
+    const closenessDelta = round2(previousDistance - currentDistance);
+
+    if (closenessDelta > RIVALRY_TREND_STABILITY_EPSILON) {
+      return 'closing';
+    }
+    if (closenessDelta < -RIVALRY_TREND_STABILITY_EPSILON) {
+      return 'widening';
+    }
+    return 'stable';
+  }
+
+  if (params.rankDelta > 0 || params.equivalentEngineeringHoursDelta > 0) {
+    return 'closing';
+  }
+  if (params.rankDelta < 0 || params.equivalentEngineeringHoursDelta < 0) {
+    return 'widening';
+  }
+  return 'stable';
 }
 
 function buildRotatingInsights(
@@ -1907,7 +2224,8 @@ export async function getLeaderboardArtifact(db: D1Database): Promise<Leaderboar
 
   const rows = rowsResult.results ?? [];
   const userIds = rows.map((row) => toNumber(row.user_id)).filter((userId) => userId > 0);
-  const [crownsByHandle, trendPayloadByUserId, heatmapPayloadByUserId, repoCardsByUserId] = await Promise.all([
+  const [freshness, crownsByHandle, trendPayloadByUserId, heatmapPayloadByUserId, repoCardsByUserId] = await Promise.all([
+    loadPayloadFreshness(db),
     loadCrownsByHandle(db),
     loadTrendPayloadByUserId(db, userIds),
     loadHeatmapPayloadByUserId(db, userIds),
@@ -1924,6 +2242,7 @@ export async function getLeaderboardArtifact(db: D1Database): Promise<Leaderboar
     const totalsCapturedAt = isIsoTimestamp(row.leaderboard_updated_at) ? row.leaderboard_updated_at : undefined;
     const trendPayload = trendPayloadByUserId.get(row.user_id) ?? { reason: 'no-profile-history' };
     const heatmapPayload = heatmapPayloadByUserId.get(row.user_id) ?? { reason: 'no-scan-history' };
+    const aiReadyScore = row.ai_ready_score === null ? undefined : toNumber(row.ai_ready_score);
 
     const totals = {
       equivalentEngineeringHours: round2(totalEeh),
@@ -1943,6 +2262,11 @@ export async function getLeaderboardArtifact(db: D1Database): Promise<Leaderboar
       commitsPerDay: totals.commitsPerDay,
     });
     const rotatingInsights = buildRotatingInsights({ rank, totals }, percentile, trendPayload.trendPoints ?? []);
+    const trust = buildTrustSignals({
+      totals,
+      aiReadyScore,
+      freshness,
+    });
     const provenance = buildProfileProvenance({
       totalsCapturedAt,
       trendPayload,
@@ -1955,7 +2279,7 @@ export async function getLeaderboardArtifact(db: D1Database): Promise<Leaderboar
       handle,
       scannedRepos: toNumber(row.scanned_repos),
       featuredRepo: row.featured_repo ?? undefined,
-      aiReadyScore: row.ai_ready_score === null ? undefined : toNumber(row.ai_ready_score),
+      aiReadyScore,
       scanInsight,
       percentile,
       stackTier: inferOperatingStackTier({
@@ -1965,6 +2289,7 @@ export async function getLeaderboardArtifact(db: D1Database): Promise<Leaderboar
       }),
       attribution: parseAttributionFromRow(row),
       provenance,
+      trust,
       crowns: crownsByHandle.get(normalizedHandle) ?? [],
       thirtyDay: {
         equivalentEngineeringHours: round2(toNumber(row.t30_equivalent_engineering_hours)),
@@ -1986,12 +2311,69 @@ export async function getLeaderboardArtifact(db: D1Database): Promise<Leaderboar
   return {
     generatedAt: new Date().toISOString(),
     sourceSeedPath: 'd1://leaderboard_rows',
+    freshness,
     entries,
   };
 }
 
 interface ProfileRow extends LeaderboardSqlRow {
   total_rows: number;
+}
+
+interface RivalCandidateSqlRow {
+  user_id: number;
+  handle: string;
+  rank: number;
+  total_equivalent_engineering_hours: number;
+  leaderboard_updated_at: string;
+}
+
+interface RivalHistorySqlRow {
+  captured_at: string;
+  rank: number;
+  equivalent_engineering_hours: number;
+}
+
+async function loadRivalCandidateByRankDistance(
+  db: D1Database,
+  userId: number,
+  rank: number,
+  equivalentEngineeringHours: number,
+): Promise<RivalCandidateSqlRow | null> {
+  return db
+    .prepare(
+      `SELECT
+         lr.user_id,
+         u.handle,
+         lr.rank,
+         lr.total_equivalent_engineering_hours,
+         lr.updated_at AS leaderboard_updated_at
+       FROM leaderboard_rows lr
+       INNER JOIN users u ON u.id = lr.user_id
+       WHERE lr.user_id != ?
+       ORDER BY
+         ABS(lr.rank - ?) ASC,
+         ABS(lr.total_equivalent_engineering_hours - ?) ASC,
+         lr.rank ASC,
+         lower(u.handle) ASC
+       LIMIT 1`,
+    )
+    .bind(userId, rank, equivalentEngineeringHours)
+    .first<RivalCandidateSqlRow>();
+}
+
+async function loadRecentRivalHistory(db: D1Database, userId: number): Promise<RivalHistorySqlRow[]> {
+  const result = await db
+    .prepare(
+      `SELECT captured_at, rank, equivalent_engineering_hours
+       FROM profile_metrics_history
+       WHERE user_id = ?
+       ORDER BY datetime(captured_at) DESC, id DESC
+       LIMIT 2`,
+    )
+    .bind(userId)
+    .all<RivalHistorySqlRow>();
+  return result.results ?? [];
 }
 
 export async function getProfileByHandle(db: D1Database, handle: string): Promise<ProfileResponse | null> {
@@ -2063,30 +2445,32 @@ export async function getProfileByHandle(db: D1Database, handle: string): Promis
     return null;
   }
 
-  const crownsResult = await db
-    .prepare('SELECT crown_key, label, awarded_at FROM crowns WHERE user_id = ? ORDER BY awarded_at DESC')
-    .bind(row.user_id)
-    .all<{ crown_key: string; label: string; awarded_at: string }>();
-
-  const historyResult = await db
-    .prepare(
-      `SELECT captured_at, rank, percentile, stack_tier, equivalent_engineering_hours, merged_prs, commits_per_day, active_coding_hours
-      FROM profile_metrics_history
-      WHERE user_id = ?
-      ORDER BY captured_at DESC
-      LIMIT 30`,
-    )
-    .bind(row.user_id)
-    .all<{
-      captured_at: string;
-      rank: number;
-      percentile: number;
-      stack_tier: number;
-      equivalent_engineering_hours: number;
-      merged_prs: number;
-      commits_per_day: number;
-      active_coding_hours: number;
-    }>();
+  const [freshness, crownsResult, historyResult] = await Promise.all([
+    loadPayloadFreshness(db),
+    db
+      .prepare('SELECT crown_key, label, awarded_at FROM crowns WHERE user_id = ? ORDER BY awarded_at DESC')
+      .bind(row.user_id)
+      .all<{ crown_key: string; label: string; awarded_at: string }>(),
+    db
+      .prepare(
+        `SELECT captured_at, rank, percentile, stack_tier, equivalent_engineering_hours, merged_prs, commits_per_day, active_coding_hours
+         FROM profile_metrics_history
+         WHERE user_id = ?
+         ORDER BY captured_at DESC
+         LIMIT 30`,
+      )
+      .bind(row.user_id)
+      .all<{
+        captured_at: string;
+        rank: number;
+        percentile: number;
+        stack_tier: number;
+        equivalent_engineering_hours: number;
+        merged_prs: number;
+        commits_per_day: number;
+        active_coding_hours: number;
+      }>(),
+  ]);
 
   const [heatmapPayloadByUserId, repoCardsByUserId] = await Promise.all([
     loadHeatmapPayloadByUserId(db, [row.user_id]),
@@ -2147,6 +2531,7 @@ export async function getProfileByHandle(db: D1Database, handle: string): Promis
     offHoursRatio: round2(toNumber(row.total_off_hours_ratio)),
     velocityAcceleration: round2(toNumber(row.total_velocity_acceleration)),
   };
+  const aiReadyScore = row.ai_ready_score === null ? undefined : toNumber(row.ai_ready_score);
   const scanInsight = normalizeScanInsight(row.scan_insight, {
     mergedPrsUnverified: totals.mergedPrsUnverified,
     mergedPrsCiVerified: totals.mergedPrsCiVerified,
@@ -2156,6 +2541,7 @@ export async function getProfileByHandle(db: D1Database, handle: string): Promis
   });
   const rotatingInsights = buildRotatingInsights({ rank, totals }, percentile, trendPayload.trendPoints ?? []);
   const totalsCapturedAt = isIsoTimestamp(row.leaderboard_updated_at) ? row.leaderboard_updated_at : undefined;
+  const trust = buildTrustSignals({ totals, aiReadyScore, freshness });
   const provenance = buildProfileProvenance({
     totalsCapturedAt,
     trendPayload,
@@ -2163,17 +2549,74 @@ export async function getProfileByHandle(db: D1Database, handle: string): Promis
     hasRotatingInsights: rotatingInsights.length > 0,
   });
 
+  let rivalry: ProfileRivalryProgression | undefined;
+  const rivalCandidate = await loadRivalCandidateByRankDistance(db, row.user_id, rank, totals.equivalentEngineeringHours);
+  if (rivalCandidate) {
+    const rivalHistoryRows = await loadRecentRivalHistory(db, rivalCandidate.user_id);
+    const rivalHistory = rivalHistoryRows.map((historyRow) => ({
+      capturedAt: toStringValue(historyRow.captured_at),
+      rank: Math.max(1, Math.round(toNumber(historyRow.rank))),
+      equivalentEngineeringHours: round2(toNumber(historyRow.equivalent_engineering_hours)),
+    }));
+
+    const latestHistory = history[0];
+    const previousHistory = history[1];
+    const rankDelta = latestHistory && previousHistory ? previousHistory.rank - latestHistory.rank : 0;
+    const equivalentEngineeringHoursDelta =
+      latestHistory && previousHistory
+        ? round2(latestHistory.equivalentEngineeringHours - previousHistory.equivalentEngineeringHours)
+        : 0;
+
+    const currentGapRank = Math.round(toNumber(rivalCandidate.rank) - rank);
+    const currentGapEquivalentEngineeringHours = round2(
+      totals.equivalentEngineeringHours - round2(toNumber(rivalCandidate.total_equivalent_engineering_hours)),
+    );
+
+    const previousGapRank =
+      previousHistory && rivalHistory[1] ? Math.round(toNumber(rivalHistory[1].rank) - previousHistory.rank) : undefined;
+    const previousGapEquivalentEngineeringHours =
+      previousHistory && rivalHistory[1]
+        ? round2(previousHistory.equivalentEngineeringHours - toNumber(rivalHistory[1].equivalentEngineeringHours))
+        : undefined;
+
+    const trend = resolveRivalryTrend({
+      currentGapRank,
+      currentGapEquivalentEngineeringHours,
+      previousGapRank,
+      previousGapEquivalentEngineeringHours,
+      rankDelta,
+      equivalentEngineeringHoursDelta,
+    });
+
+    const rivalryCapturedAt =
+      latestIsoTimestamp(latestHistory?.capturedAt, rivalHistory[0]?.capturedAt) ??
+      latestIsoTimestamp(totalsCapturedAt, isIsoTimestamp(rivalCandidate.leaderboard_updated_at) ? rivalCandidate.leaderboard_updated_at : undefined) ??
+      toStringValue(row.leaderboard_updated_at, '1970-01-01T00:00:00.000Z');
+
+    rivalry = {
+      rivalHandle: toStringValue(rivalCandidate.handle),
+      source: 'server',
+      capturedAt: rivalryCapturedAt,
+      trend,
+      rankDelta,
+      equivalentEngineeringHoursDelta,
+      currentGapEquivalentEngineeringHours,
+      currentGapRank,
+    };
+  }
+
   const leaderboard: LeaderboardEntry = {
     rank,
     handle: toStringValue(row.handle),
     scannedRepos: toNumber(row.scanned_repos),
     featuredRepo: row.featured_repo ?? undefined,
-    aiReadyScore: row.ai_ready_score === null ? undefined : toNumber(row.ai_ready_score),
+    aiReadyScore,
     scanInsight,
     percentile,
     stackTier,
     attribution: parseAttributionFromRow(row),
     provenance,
+    trust,
     crowns: crowns.map((crown) => crown.key),
     thirtyDay: {
       equivalentEngineeringHours: round2(toNumber(row.t30_equivalent_engineering_hours)),
@@ -2197,6 +2640,8 @@ export async function getProfileByHandle(db: D1Database, handle: string): Promis
     crowns,
     leaderboard,
     history,
+    rivalry,
+    freshness,
   };
 }
 
