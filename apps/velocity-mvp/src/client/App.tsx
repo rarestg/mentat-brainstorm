@@ -38,6 +38,19 @@ const UX_EVENT_STORAGE_KEY = 'mentat.velocity.ux.events';
 const PROFILE_VISIT_STORAGE_KEY_PREFIX = 'mentat.velocity.profile.lastVisit.';
 const HANDLE_PATTERN = /^[A-Za-z0-9_.-]+$/;
 
+export const HERO_SEARCH_PROMPT = 'Search your GitHub handle to see your Velocity.';
+export const HERO_PRIMARY_CTA_LABEL = 'Connect GitHub to Claim Profile';
+export const LEADERBOARD_DESKTOP_COLUMNS = [
+  'Rank',
+  'Dev',
+  'Operating Stack',
+  'EEH (30d)',
+  'Merged PRs (CI-Verified)',
+  'Velocity Accel',
+] as const;
+
+const OPERATING_STACK_LABELS = ['Human Level', 'Copilot User', 'Single Agent', 'Agent Swarm'] as const;
+
 function formatPercent(v: number): string {
   return `${(v * 100).toFixed(0)}%`;
 }
@@ -213,6 +226,11 @@ export function parseChallengeQuery(search: string): { targetHandle: string | nu
     return { targetHandle: null, hasInvalidQuery: true };
   }
   return { targetHandle: normalized, hasInvalidQuery: false };
+}
+
+export function isDebugEnabled(search: string): boolean {
+  const params = new URLSearchParams(search);
+  return params.get('debug') === 'true';
 }
 
 export function parseRoute(pathname: string, search: string): Route {
@@ -602,24 +620,101 @@ function getPercentile(entry: LeaderboardEntry, totalEntries: number): number {
 
 function getTier(entry: LeaderboardEntry, percentile: number): string {
   if (typeof entry.stackTier === 'number') {
-    return `Operating Stack Tier ${entry.stackTier}`;
+    const normalizedTier = clamp(Math.round(entry.stackTier), 0, OPERATING_STACK_LABELS.length - 1);
+    return OPERATING_STACK_LABELS[normalizedTier];
   }
   if (entry.profile?.tier) {
+    const tierMatch = entry.profile.tier.match(/tier\s*([0-3])/i);
+    if (tierMatch) {
+      const normalizedTier = clamp(Number(tierMatch[1]), 0, OPERATING_STACK_LABELS.length - 1);
+      return OPERATING_STACK_LABELS[normalizedTier];
+    }
     return entry.profile.tier;
   }
-  if (percentile >= 0.98) {
-    return 'Mythic';
-  }
   if (percentile >= 0.9) {
-    return 'Titan';
+    return 'Agent Swarm';
   }
-  if (percentile >= 0.75) {
-    return 'Accelerator';
+  if (percentile >= 0.65) {
+    return 'Single Agent';
   }
-  if (percentile >= 0.5) {
-    return 'Builder';
+  if (percentile >= 0.35) {
+    return 'Copilot User';
   }
-  return 'Contender';
+  return 'Human Level';
+}
+
+function getTierBadge(tier: string): { label: string; className: string } {
+  const normalizedTier = tier.toLowerCase();
+  if (normalizedTier.includes('agent swarm')) {
+    return {
+      label: 'Agent Swarm',
+      className: 'border-emerald-400/50 bg-emerald-500/10 text-emerald-100',
+    };
+  }
+  if (normalizedTier.includes('single agent')) {
+    return {
+      label: 'Single Agent',
+      className: 'border-cyan-400/50 bg-cyan-500/10 text-cyan-100',
+    };
+  }
+  if (normalizedTier.includes('copilot')) {
+    return {
+      label: 'Copilot User',
+      className: 'border-sky-400/50 bg-sky-500/10 text-sky-100',
+    };
+  }
+  return {
+    label: 'Human Level',
+    className: 'border-slate-600/90 bg-slate-900/60 text-ink-2',
+  };
+}
+
+function getTrustBadge(state?: VerifiedAgentOutputStatus['state']): { label: string; className: string } {
+  if (state === 'verified') {
+    return {
+      label: 'CI Trusted',
+      className: 'border-emerald-400/50 bg-emerald-500/10 text-emerald-100',
+    };
+  }
+  if (state === 'pending') {
+    return {
+      label: 'Trust Pending',
+      className: 'border-amber-400/50 bg-amber-400/10 text-amber-100',
+    };
+  }
+  return {
+    label: 'Trust Unknown',
+    className: 'border-slate-600/90 bg-slate-900/60 text-ink-2',
+  };
+}
+
+function hasZeroLeaderboardMetrics(entry: LeaderboardEntry): boolean {
+  return entry.totals.equivalentEngineeringHours <= 0 && entry.totals.mergedPrsCiVerified <= 0;
+}
+
+function getRankTone(rank: number): { textClassName: string; badgeClassName: string } {
+  if (rank === 1) {
+    return {
+      textClassName: 'text-amber-200',
+      badgeClassName: 'border-amber-300/60 bg-amber-400/15 text-amber-100',
+    };
+  }
+  if (rank === 2) {
+    return {
+      textClassName: 'text-slate-100',
+      badgeClassName: 'border-slate-300/50 bg-slate-300/10 text-slate-100',
+    };
+  }
+  if (rank === 3) {
+    return {
+      textClassName: 'text-orange-200',
+      badgeClassName: 'border-orange-300/60 bg-orange-400/15 text-orange-100',
+    };
+  }
+  return {
+    textClassName: 'text-accent-2',
+    badgeClassName: 'border-slate-700 bg-slate-900/60 text-ink-2',
+  };
 }
 
 function buildTrendPoints(entry: LeaderboardEntry): number[] {
@@ -748,6 +843,8 @@ export function App() {
   const [isAuthLoading, setIsAuthLoading] = useState(true);
   const [isSigningOut, setIsSigningOut] = useState(false);
   const [shareFeedback, setShareFeedback] = useState<string | null>(null);
+  const [leaderboardHandleSearch, setLeaderboardHandleSearch] = useState('');
+  const [leaderboardHandleSearchError, setLeaderboardHandleSearchError] = useState<string | null>(null);
   const profileVisitSignatureRef = useRef<string>('');
   const challengeTelemetrySignatureRef = useRef<string>('');
   const rivalryTelemetrySignatureRef = useRef<string>('');
@@ -941,28 +1038,6 @@ export function App() {
     return sortedEntries.find((entry) => entry.handle.toLowerCase() === route.handle) ?? null;
   }, [profileData, route, sortedEntries]);
 
-  const kpis = useMemo(() => {
-    if (!leaderboard || leaderboard.entries.length === 0) {
-      return {
-        creators: 0,
-        repos: 0,
-        avgEeh: 0,
-      };
-    }
-
-    const creators = leaderboard.entries.length;
-    const repos = leaderboard.entries.reduce((sum, entry) => sum + entry.scannedRepos, 0);
-    const avgEeh =
-      leaderboard.entries.reduce((sum, entry) => sum + entry.totals.equivalentEngineeringHours, 0) /
-      creators;
-
-    return {
-      creators,
-      repos,
-      avgEeh: Math.round(avgEeh * 10) / 10,
-    };
-  }, [leaderboard]);
-
   const profilePercentile = useMemo(() => {
     if (!profileEntry) {
       return 0;
@@ -1135,6 +1210,25 @@ export function App() {
     });
   }
 
+  function onLeaderboardSearchSubmit(event: React.FormEvent) {
+    event.preventDefault();
+    const normalized = normalizeHandle(leaderboardHandleSearch.trim().replace(/^@+/, ''));
+    if (!normalized) {
+      setLeaderboardHandleSearchError('Enter a valid GitHub handle.');
+      trackUxEvent('leaderboard_handle_search_invalid', {
+        source: 'home_hero',
+      });
+      return;
+    }
+
+    setLeaderboardHandleSearchError(null);
+    trackUxEvent('leaderboard_handle_search_submitted', {
+      source: 'home_hero',
+      handle: normalized,
+    });
+    openProfile(normalized);
+  }
+
   async function onSignOut() {
     setIsSigningOut(true);
     setAuthError(null);
@@ -1289,8 +1383,8 @@ export function App() {
     ((normalizedAuthHandle !== null && route.handle === normalizedAuthHandle) ||
       (normalizedAuthLogin !== null && route.handle === normalizedAuthLogin));
   const appOrigin = window.location.origin;
+  const debugEnabled = isDebugEnabled(window.location.search);
   const challengeActorHandle = authIdentity?.handle ?? profileEntry?.handle ?? null;
-  const normalizedActorHandle = challengeActorHandle?.toLowerCase() ?? null;
   const currentActorHandleForTelemetry = challengeActorHandle ?? 'unclaimed';
   const inviteShareUrl = `${appOrigin}/`;
   const routeChallengeTargetHandle = route.kind === 'profile' ? route.challengeTargetHandle : null;
@@ -1368,10 +1462,6 @@ export function App() {
     }
     return clamp(7 - daysSince, 0, 7);
   }, [lastProfileVisit]);
-  const defaultChallengeTarget = sortedEntries.find((entry) => (normalizedActorHandle ? entry.handle !== normalizedActorHandle : true)) ?? null;
-  const myProfileShareUrl = authIdentity ? buildProfileUrl(appOrigin, authIdentity.handle) : null;
-  const leaderboardChallengeUrl =
-    defaultChallengeTarget && challengeActorHandle ? buildChallengeLink(appOrigin, challengeActorHandle, defaultChallengeTarget.handle) : null;
   const scanPersistenceSummary = useMemo(() => {
     if (!scanResult) {
       return null;
@@ -1625,7 +1715,7 @@ export function App() {
                     <h2 className="mt-2 font-display text-2xl leading-tight sm:text-3xl">@{profileEntry.handle}</h2>
                     <div className="mt-3 flex flex-wrap items-center gap-2">
                       <span className="max-w-full break-words rounded-full border border-cyan-400/40 bg-cyan-500/10 px-3 py-1 font-mono text-xs text-cyan-200">
-                        {profileTier} Tier
+                        Operating Stack: {profileTier}
                       </span>
                       <span className="max-w-full break-words rounded-full border border-slate-600 px-3 py-1 font-mono text-xs text-ink-2">
                         Global Rank #{globalRank}
@@ -1846,7 +1936,7 @@ export function App() {
                       </button>
                     </div>
                   ) : null}
-                  {profileFreshnessPresentation.debugAttribution ? (
+                  {debugEnabled && profileFreshnessPresentation.debugAttribution ? (
                     <p className="mt-2 font-mono text-[11px] text-ink-2">Debug: {profileFreshnessPresentation.debugAttribution}</p>
                   ) : null}
                 </div>
@@ -2218,183 +2308,87 @@ export function App() {
             </section>
           )
         ) : (
-          <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
-            <section className="space-y-6 lg:col-span-8">
-              <div className="rounded-xl border border-slate-700/80 bg-surface-1 p-5 shadow-soft">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div>
-                    <h2 className="font-display text-3xl leading-tight">Mentat Velocity Snapshot</h2>
-                    <p className="mt-1 text-sm text-ink-2">
-                      30-day snapshots for seeded and claimed handles. Canonical ranking uses strict handle-authored attribution and explicit persistence eligibility.
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2 rounded-lg bg-surface-2 p-1">
-                    <button
-                      className={`rounded-md px-3 py-2 text-sm ${
-                        view === 'leaderboard' ? 'bg-gradient-to-r from-cyan-400 to-sky-500 text-slate-950' : 'text-ink-2'
-                      }`}
-                      onClick={() => setView('leaderboard')}
-                      type="button"
-                    >
-                      Leaderboard
-                    </button>
-                    <button
-                      className={`rounded-md px-3 py-2 text-sm ${
-                        view === 'scan' ? 'bg-gradient-to-r from-cyan-400 to-sky-500 text-slate-950' : 'text-ink-2'
-                      }`}
-                      onClick={() => setView('scan')}
-                      type="button"
-                    >
-                      Scan Repo
-                    </button>
-                  </div>
-                </div>
-
-                <div className="mt-4 flex flex-wrap items-center gap-2">
-                  {myProfileShareUrl ? (
-                    <>
-                      <button
-                        className="min-h-11 rounded-lg border border-cyan-400/60 bg-cyan-500/10 px-3 py-2 text-xs font-mono text-cyan-100 hover:bg-cyan-500/20"
-                        onClick={() =>
-                          void triggerOutboundShare({
-                            event: 'profile_share_clicked',
-                            source: 'home_hero',
-                            handle: authIdentity?.handle ?? 'signed-out',
-                            title: 'Mentat Velocity Profile',
-                            text: 'My Mentat Velocity profile is live. Benchmark my AI-verified throughput.',
-                            url: myProfileShareUrl,
-                          })
-                        }
-                        type="button"
-                      >
-                        Share My Profile
-                      </button>
-                      <button
-                        className="min-h-11 rounded-lg border border-cyan-400/40 px-3 py-2 text-xs font-mono text-cyan-100 hover:bg-cyan-500/15"
-                        onClick={() =>
-                          void copyShareLink({
-                            event: 'profile_share_clicked',
-                            source: 'home_hero',
-                            handle: authIdentity?.handle ?? 'signed-out',
-                            url: myProfileShareUrl,
-                          })
-                        }
-                        type="button"
-                      >
-                        Copy Link
-                      </button>
-                    </>
-                  ) : (
-                    <a
-                      className="min-h-11 inline-flex items-center rounded-lg border border-slate-600 px-3 py-2 text-xs font-mono text-ink-2 hover:border-cyan-400 hover:text-ink-1"
-                      href="/api/auth/github/start"
-                      onClick={() => trackUxEvent('claim_profile_clicked', { source: 'home_hero', signedIn: false })}
-                    >
-                      Sign in to Claim Profile
-                    </a>
-                  )}
-                  {leaderboardChallengeUrl && defaultChallengeTarget ? (
-                    <>
-                      <button
-                        className="min-h-11 rounded-lg border border-amber-400/50 bg-amber-400/10 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/20"
-                        onClick={() =>
-                          void triggerOutboundShare({
-                            event: 'challenge_link_clicked',
-                            source: 'home_hero',
-                            challenger: currentActorHandleForTelemetry,
-                            target: defaultChallengeTarget.handle,
-                            title: 'Mentat Velocity Challenge',
-                            text: `Open challenge: @${defaultChallengeTarget.handle}, let's compare AI-verified throughput on Mentat Velocity.`,
-                            url: leaderboardChallengeUrl,
-                          })
-                        }
-                        type="button"
-                      >
-                        Challenge @{defaultChallengeTarget.handle}
-                      </button>
-                      <button
-                        className="min-h-11 rounded-lg border border-amber-400/40 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/12"
-                        onClick={() =>
-                          void copyShareLink({
-                            event: 'challenge_link_clicked',
-                            source: 'home_hero',
-                            challenger: currentActorHandleForTelemetry,
-                            target: defaultChallengeTarget.handle,
-                            url: leaderboardChallengeUrl,
-                          })
-                        }
-                        type="button"
-                      >
-                        Copy Challenge
-                      </button>
-                    </>
-                  ) : (
-                    <a
-                      className="min-h-11 inline-flex items-center rounded-lg border border-amber-400/40 px-3 py-2 text-xs font-mono text-amber-100 hover:bg-amber-400/10"
-                      href="/api/auth/github/start"
-                      onClick={() => trackUxEvent('claim_profile_clicked', { source: 'home_hero_challenge_gate', signedIn: false })}
-                    >
-                      Claim Profile to Challenge
-                    </a>
-                  )}
+          <div className="space-y-6">
+            <section className="relative overflow-hidden rounded-xl border border-cyan-400/25 bg-slate-950/70 p-5 text-center shadow-soft md:p-8">
+              <div className="pointer-events-none absolute left-1/2 top-0 h-40 w-[30rem] -translate-x-1/2 -translate-y-1/2 rounded-full bg-cyan-400/20 blur-3xl" />
+              <div className="relative">
+                <p className="font-mono text-[11px] uppercase tracking-[0.16em] text-cyan-200/90">Public Velocity Arena</p>
+                <div className="mx-auto mt-4 mb-5 flex w-fit items-center gap-2 rounded-lg border border-slate-700/80 bg-surface-2/90 p-1">
                   <button
-                    className="min-h-11 rounded-lg border border-slate-600 px-3 py-2 text-xs font-mono text-ink-2 hover:border-cyan-400 hover:text-ink-1"
-                    onClick={() =>
-                      void triggerOutboundShare({
-                        event: 'invite_link_clicked',
-                        source: 'home_hero',
-                        title: 'Mentat Velocity',
-                        text: 'Track AI-verified throughput and challenge me on Mentat Velocity.',
-                        url: inviteShareUrl,
-                      })
-                    }
+                    className={`rounded-md px-3 py-2 text-sm ${
+                      view === 'leaderboard' ? 'bg-gradient-to-r from-cyan-400 to-sky-500 text-slate-950' : 'text-ink-2'
+                    }`}
+                    onClick={() => setView('leaderboard')}
                     type="button"
                   >
-                    Invite Peer
+                    Leaderboard
                   </button>
                   <button
-                    className="min-h-11 rounded-lg border border-slate-600 px-3 py-2 text-xs font-mono text-ink-2 hover:border-cyan-400 hover:text-ink-1"
-                    onClick={() =>
-                      void copyShareLink({
-                        event: 'invite_link_clicked',
-                        source: 'home_hero',
-                        url: inviteShareUrl,
-                      })
-                    }
+                    className={`rounded-md px-3 py-2 text-sm ${
+                      view === 'scan' ? 'bg-gradient-to-r from-cyan-400 to-sky-500 text-slate-950' : 'text-ink-2'
+                    }`}
+                    onClick={() => setView('scan')}
                     type="button"
                   >
-                    Copy Invite Link
+                    Scan Repo
                   </button>
-                </div>
-
-                <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
-                  <div className="rounded-lg border border-slate-700 bg-surface-2 p-3">
-                    <p className="font-mono text-xs uppercase tracking-wide text-ink-3">Seed Handles</p>
-                    <p className="mt-1 text-2xl font-semibold">{kpis.creators}</p>
-                  </div>
-                  <div className="rounded-lg border border-slate-700 bg-surface-2 p-3">
-                    <p className="font-mono text-xs uppercase tracking-wide text-ink-3">Repos Scanned</p>
-                    <p className="mt-1 text-2xl font-semibold">{kpis.repos}</p>
-                  </div>
-                  <div className="rounded-lg border border-slate-700 bg-surface-2 p-3">
-                    <p className="font-mono text-xs uppercase tracking-wide text-ink-3">Avg EEH (30d)</p>
-                    <p className="mt-1 text-2xl font-semibold">{kpis.avgEeh}</p>
-                  </div>
                 </div>
               </div>
+              <h2 className="relative font-display text-3xl leading-tight sm:text-5xl">Velocity Leaderboard</h2>
+              <p className="relative mt-2 text-base text-ink-1">{HERO_SEARCH_PROMPT}</p>
+              <form className="relative mx-auto mt-6 flex w-full max-w-2xl flex-col gap-3 sm:flex-row" onSubmit={onLeaderboardSearchSubmit}>
+                <input
+                  aria-label="GitHub handle search"
+                  className="h-11 w-full rounded-lg border border-cyan-300/50 bg-slate-950/80 px-3 text-sm text-ink-1 outline-none transition focus:border-cyan-200 focus:ring-2 focus:ring-cyan-300/30"
+                  onChange={(event) => {
+                    setLeaderboardHandleSearch(event.target.value);
+                    if (leaderboardHandleSearchError) {
+                      setLeaderboardHandleSearchError(null);
+                    }
+                  }}
+                  placeholder="@octocat"
+                  value={leaderboardHandleSearch}
+                />
+                <button
+                  className="h-11 rounded-lg bg-gradient-to-r from-cyan-400 to-sky-500 px-5 text-sm font-semibold text-slate-950 shadow-[0_8px_24px_rgba(34,211,238,0.35)] transition hover:brightness-105"
+                  type="submit"
+                >
+                  Search Velocity
+                </button>
+              </form>
+              {leaderboardHandleSearchError ? <p className="mt-2 text-sm text-state-warning">{leaderboardHandleSearchError}</p> : null}
+              {!authIdentity ? (
+                <a
+                  className="mt-5 inline-flex min-h-11 items-center justify-center rounded-lg border border-cyan-300/70 bg-cyan-500/20 px-5 py-2 text-sm font-semibold text-cyan-100 transition hover:bg-cyan-500/30"
+                  href="/api/auth/github/start"
+                  onClick={() => trackUxEvent('claim_profile_clicked', { source: 'home_hero', signedIn: false })}
+                >
+                  {HERO_PRIMARY_CTA_LABEL}
+                </a>
+              ) : (
+                <div className="mt-5 flex flex-wrap items-center justify-center gap-2">
+                  <button
+                    className="min-h-11 rounded-lg border border-cyan-400/60 bg-cyan-500/15 px-4 py-2 text-sm font-semibold text-cyan-100 transition hover:bg-cyan-500/25"
+                    onClick={() => openProfile(authIdentity.handle)}
+                    type="button"
+                  >
+                    Open @{authIdentity.handle}
+                  </button>
+                  <span className="rounded-full border border-emerald-400/40 bg-emerald-500/10 px-3 py-1 font-mono text-xs text-emerald-200">
+                    GitHub connected
+                  </span>
+                </div>
+              )}
+            </section>
 
               {view === 'leaderboard' ? (
-                <section className="rounded-xl border border-slate-700/80 bg-surface-1 p-4 shadow-soft md:p-5">
+                <section className="rounded-xl border border-slate-700/80 bg-surface-1 p-4 shadow-soft md:p-6">
                   <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
                     <div>
                       <h3 className="font-display text-xl">Rankings</h3>
-                      <p className="font-mono text-xs text-ink-3">
-                        {leaderboard?.generatedAt
-                          ? `Static bootstrap snapshot: ${new Date(leaderboard.generatedAt).toLocaleString()}`
-                          : 'No artifact generated yet'}
-                      </p>
+                      <p className="text-sm text-ink-2">CI-verified merged PR throughput across the current 30-day window.</p>
                       {lastLeaderboardRefreshAt ? (
-                        <p className="font-mono text-xs text-emerald-200">Refreshed: {new Date(lastLeaderboardRefreshAt).toLocaleString()}</p>
+                        <p className="mt-1 font-mono text-xs text-emerald-200">Refreshed {new Date(lastLeaderboardRefreshAt).toLocaleString()}</p>
                       ) : null}
                     </div>
                     <button
@@ -2408,32 +2402,21 @@ export function App() {
                       {isLeaderboardRefreshing ? 'Refreshing...' : 'Refresh Leaderboard'}
                     </button>
                   </div>
-                  <p className="mb-4 rounded-md border border-slate-700 bg-surface-2 px-3 py-2 text-xs text-ink-2">
-                    Methodology: EEH and ranking use CI-verified merged PRs on the default branch; unverified merged PR totals are shown for transparency.
-                  </p>
                   <div className={`mb-4 rounded-md border px-3 py-2 text-xs ${getFreshnessToneClasses(leaderboardFreshnessPresentation.tone)}`}>
-                    <p className="font-mono uppercase tracking-[0.08em]">{leaderboardFreshnessPresentation.headline}</p>
-                    <p className="mt-1">{leaderboardFreshnessPresentation.detail}</p>
-                    {leaderboardFreshnessPresentation.timestamps.length > 0 ? (
-                      <p className="mt-1 font-mono">
-                        Latest:{' '}
-                        {leaderboardFreshnessPresentation.timestamps
-                          .map((marker) => `${marker.label} ${formatFreshnessTimestamp(marker.iso)}`)
-                          .join(' | ')}
-                      </p>
-                    ) : (
-                      <p className="mt-1">Latest snapshot and refresh timestamps are not available in this payload.</p>
-                    )}
-                    {leaderboardFreshnessPresentation.note ? <p className="mt-1">Note: {leaderboardFreshnessPresentation.note}</p> : null}
+                    <p className="font-mono uppercase tracking-[0.08em]">
+                      {leaderboardFreshnessPresentation.isStale ? 'Snapshot status: stale' : 'Snapshot status: healthy'}
+                    </p>
+                    <p className="mt-1">
+                      {leaderboardFreshnessPresentation.timestamps.length > 0
+                        ? leaderboardFreshnessPresentation.timestamps
+                            .map((marker) => `${marker.label} ${formatFreshnessTimestamp(marker.iso)}`)
+                            .join(' | ')
+                        : 'Latest snapshot timestamp unavailable.'}
+                    </p>
                     {leaderboardFreshnessPresentation.isStale ? (
                       <div className="mt-2 rounded-md border border-rose-300/60 bg-rose-500/15 p-2 text-rose-100">
                         <p className="font-mono uppercase tracking-[0.08em]">Stale Snapshot Warning</p>
-                        <p className="mt-1">Leaderboard positions may be outdated until a fresh backend snapshot is fetched.</p>
-                        {leaderboardFreshnessPresentation.staleReasonText.length > 0 ? (
-                          <p className="mt-1">Reasons: {leaderboardFreshnessPresentation.staleReasonText.join(' | ')}</p>
-                        ) : (
-                          <p className="mt-1">Reason codes were not provided by the payload.</p>
-                        )}
+                        <p className="mt-1">Leaderboard positions may lag until a fresh backend snapshot is fetched.</p>
                         <button
                           className="mt-2 min-h-11 rounded-md border border-rose-300/70 bg-rose-400/20 px-3 py-2 font-mono text-[11px] text-rose-100 hover:bg-rose-400/30 disabled:opacity-60"
                           disabled={isLeaderboardRefreshing}
@@ -2446,10 +2429,24 @@ export function App() {
                         </button>
                       </div>
                     ) : null}
-                    {leaderboardFreshnessPresentation.debugAttribution ? (
-                      <p className="mt-2 font-mono text-[11px] text-ink-2">Debug: {leaderboardFreshnessPresentation.debugAttribution}</p>
-                    ) : null}
                   </div>
+                  {debugEnabled ? (
+                    <div className={`mb-4 rounded-md border px-3 py-2 text-xs ${getFreshnessToneClasses(leaderboardFreshnessPresentation.tone)}`}>
+                      <p className="font-mono uppercase tracking-[0.08em]">Debug Freshness Payload</p>
+                      <p className="mt-1">{leaderboardFreshnessPresentation.headline}</p>
+                      <p className="mt-1">{leaderboardFreshnessPresentation.detail}</p>
+                      {leaderboardFreshnessPresentation.note ? <p className="mt-1">Note: {leaderboardFreshnessPresentation.note}</p> : null}
+                      {leaderboardFreshnessPresentation.staleReasonText.length > 0 ? (
+                        <p className="mt-1">Reasons: {leaderboardFreshnessPresentation.staleReasonText.join(' | ')}</p>
+                      ) : null}
+                      {leaderboardFreshnessPresentation.debugAttribution ? (
+                        <p className="mt-1 font-mono text-[11px] text-ink-2">{leaderboardFreshnessPresentation.debugAttribution}</p>
+                      ) : null}
+                      {leaderboard?.generatedAt ? (
+                        <p className="mt-1 font-mono text-[11px] text-ink-2">Artifact generated: {new Date(leaderboard.generatedAt).toLocaleString()}</p>
+                      ) : null}
+                    </div>
+                  ) : null}
                   {leaderboardError ? <p className="text-sm text-state-danger">{leaderboardError}</p> : null}
                   <div className="mb-3 grid gap-3 sm:hidden">
                     {!leaderboardError && !leaderboard ? (
@@ -2462,315 +2459,165 @@ export function App() {
                     ) : null}
                     {sortedEntries.map((entry) => {
                       const percentile = getPercentile(entry, sortedEntries.length);
-                      const scanAction = buildScanActionRecommendation(entry);
-                      const verificationPresentation = buildVerificationPresentation(entry.trust?.verification);
-                      const anomalySummary = summarizeAnomalies(entry.trust?.anomalies, 1);
-                      const nextHigher = sortedEntries.find((candidate) => candidate.rank === entry.rank - 1) ?? null;
-                      const eehGapToNext = nextHigher ? nextHigher.totals.equivalentEngineeringHours - entry.totals.equivalentEngineeringHours : null;
-                      const shareEntryUrl = buildProfileUrl(appOrigin, entry.handle);
-                      const challengeEntryUrl =
-                        challengeActorHandle && entry.handle !== normalizedActorHandle
-                          ? buildChallengeLink(appOrigin, challengeActorHandle, entry.handle)
-                          : null;
+                      const tier = getTier(entry, percentile);
+                      const tierBadge = getTierBadge(tier);
+                      const trustBadge = getTrustBadge(entry.trust?.verification?.state);
+                      const rankTone = getRankTone(entry.rank);
+                      const isMuted = hasZeroLeaderboardMetrics(entry);
                       return (
-                        <div key={`${entry.handle}-mobile`} className="rounded-lg border border-slate-700 bg-slate-950/35 p-3">
-                          <div className="flex items-center justify-between gap-2">
-                            <button className="font-mono text-xs text-accent-2 hover:underline" onClick={() => openProfile(entry.handle)} type="button">
-                              #{entry.rank} @{entry.handle}
-                            </button>
-                            <p className="font-mono text-xs text-ink-3">{entry.scannedRepos} repo(s)</p>
-                          </div>
-                          <div className="mt-2 flex items-center justify-between">
-                            <p className="text-sm text-ink-2">Percentile</p>
-                            <p className="font-mono text-sm">{formatPercent(percentile)}</p>
-                          </div>
-                          <div className="mt-1 flex items-center justify-between">
-                            <p className="text-sm text-ink-2">EEH</p>
-                            <p className="font-mono text-sm">{formatNumber(entry.totals.equivalentEngineeringHours, 1)}</p>
-                          </div>
-                          <div className="mt-1 flex items-center justify-between">
-                            <p className="text-sm text-ink-2">CI Merged PRs</p>
-                            <p className="font-mono text-sm">{formatNumber(entry.totals.mergedPrsCiVerified, 0)}</p>
-                          </div>
-                          <div className="mt-1 flex items-center justify-between">
-                            <p className="text-sm text-ink-2">EEH Accel</p>
-                            <p className={`font-mono text-sm ${entry.totals.velocityAcceleration >= 0 ? 'text-state-success' : 'text-state-warning'}`}>
-                              {formatAcceleration(entry.totals.velocityAcceleration)}
-                            </p>
-                          </div>
-                          {eehGapToNext !== null ? (
-                            <div className="mt-1 flex items-center justify-between">
-                              <p className="text-sm text-ink-2">Gap to #{nextHigher?.rank}</p>
-                              <p className="font-mono text-sm text-ink-2">{formatNumber(Math.max(0, eehGapToNext), 1)} EEH</p>
-                            </div>
-                          ) : (
-                            <div className="mt-1 flex items-center justify-between">
-                              <p className="text-sm text-ink-2">Lead Position</p>
-                              <p className="font-mono text-sm text-state-success">#1 pace</p>
-                            </div>
-                          )}
-                          <p className="mt-2 rounded border border-cyan-400/35 bg-cyan-500/10 px-2 py-1 text-xs text-cyan-100">
-                            {formatNextFixDetail(entry.scanInsight ?? scanAction.detail)}
-                          </p>
-                          <div className={`mt-2 rounded border px-2 py-1 text-xs ${verificationPresentation.toneClass}`}>
-                            <p className="font-mono uppercase tracking-[0.08em]">{verificationPresentation.label}</p>
-                            <p className="mt-1">{compactReasonText(verificationPresentation.reason, 96)}</p>
-                          </div>
-                          {anomalySummary.visible.length > 0 ? (
-                            <div className="mt-2 space-y-1">
-                              {anomalySummary.visible.map((flag) => (
-                                <div key={`${entry.handle}-${flag.key}`} className={`rounded border px-2 py-1 text-xs ${getAnomalySeverityToneClasses(flag.severity)}`}>
-                                  <p className="font-mono uppercase tracking-[0.08em]">
-                                    Severity {flag.severity.toUpperCase()} | {flag.label}
-                                  </p>
-                                  <p className="mt-1">{compactReasonText(flag.reason, 88)}</p>
+                        <div
+                          key={`${entry.handle}-mobile`}
+                          className={`cursor-pointer rounded-lg border p-3 transition-colors hover:bg-slate-800/50 ${
+                            entry.rank <= 3 ? 'border-amber-400/40 bg-amber-500/5' : 'border-slate-700 bg-slate-950/35'
+                          }`}
+                          onClick={() => openProfile(entry.handle)}
+                          onKeyDown={(event) => {
+                            if (event.key === 'Enter' || event.key === ' ') {
+                              event.preventDefault();
+                              openProfile(entry.handle);
+                            }
+                          }}
+                          role="button"
+                          tabIndex={0}
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="flex min-w-0 items-center gap-3">
+                              <div className="flex items-center gap-2">
+                                <span className={`rounded-full border px-2 py-0.5 font-mono text-xs ${rankTone.badgeClassName}`}>#{entry.rank}</span>
+                                <div className="relative h-10 w-10 overflow-hidden rounded-full border border-slate-700 bg-slate-900/80">
+                                  <span className="absolute inset-0 flex items-center justify-center font-mono text-xs text-ink-2">
+                                    {entry.handle.slice(0, 1).toUpperCase()}
+                                  </span>
+                                  <img
+                                    alt={`GitHub avatar for @${entry.handle}`}
+                                    className="absolute inset-0 h-full w-full object-cover"
+                                    onError={(event) => {
+                                      event.currentTarget.style.visibility = 'hidden';
+                                    }}
+                                    src={`https://github.com/${encodeURIComponent(entry.handle)}.png?size=80`}
+                                  />
                                 </div>
-                              ))}
-                              {anomalySummary.remaining > 0 ? (
-                                <p className="text-xs text-ink-3">+{anomalySummary.remaining} additional anomaly flag(s)</p>
-                              ) : null}
+                              </div>
+                              <div className="min-w-0">
+                                <p className="truncate text-sm font-medium text-ink-1">@{entry.handle}</p>
+                                <div className="mt-1 flex flex-wrap items-center gap-1">
+                                  <span className={`rounded-full border px-2 py-0.5 font-mono text-[11px] ${tierBadge.className}`}>
+                                    {tierBadge.label}
+                                  </span>
+                                  <span className={`rounded-full border px-2 py-0.5 font-mono text-[11px] ${trustBadge.className}`}>
+                                    {trustBadge.label}
+                                  </span>
+                                </div>
+                              </div>
                             </div>
-                          ) : null}
-                          <div className="mt-3 flex items-center gap-2">
-                            {entry.featuredRepo ? (
-                              <button
-                                className="min-h-11 min-w-11 rounded border border-emerald-400/50 bg-emerald-500/10 px-3 py-2 text-[11px] font-mono text-emerald-100 hover:bg-emerald-500/20"
-                                onClick={() => startScanFromRepo(entry.featuredRepo!, 'leaderboard_mobile_row')}
-                                type="button"
+                            <div className="text-right">
+                              <p className={`font-mono text-xl ${isMuted ? 'text-ink-3' : 'text-cyan-100'}`}>
+                                {formatNumber(entry.totals.equivalentEngineeringHours, 1)}
+                              </p>
+                              <p
+                                className={`font-mono text-xs ${
+                                  isMuted ? 'text-ink-3' : entry.totals.velocityAcceleration >= 0 ? 'text-state-success' : 'text-state-warning'
+                                }`}
                               >
-                                Scan
-                              </button>
-                            ) : null}
-                            <button
-                              className="min-h-11 min-w-11 rounded border border-cyan-400/50 bg-cyan-500/10 px-3 py-2 text-[11px] font-mono text-cyan-100 hover:bg-cyan-500/20"
-                              onClick={() =>
-                                void triggerOutboundShare({
-                                  event: 'profile_share_clicked',
-                                  source: 'leaderboard_mobile_row',
-                                  handle: entry.handle,
-                                  title: 'Mentat Velocity Profile',
-                                  text: `Mentat Velocity profile check: @${entry.handle} is currently #${entry.rank}.`,
-                                  url: shareEntryUrl,
-                                })
-                              }
-                              type="button"
-                            >
-                              Share
-                            </button>
-                            <button
-                              className="min-h-11 min-w-11 rounded border border-cyan-400/40 px-3 py-2 text-[11px] font-mono text-cyan-100 hover:bg-cyan-500/15"
-                              onClick={() =>
-                                void copyShareLink({
-                                  event: 'profile_share_clicked',
-                                  source: 'leaderboard_mobile_row',
-                                  handle: entry.handle,
-                                  url: shareEntryUrl,
-                                })
-                              }
-                              type="button"
-                            >
-                              Copy
-                            </button>
-                            {challengeEntryUrl ? (
-                              <button
-                                className="min-h-11 min-w-11 rounded border border-amber-400/50 bg-amber-400/10 px-3 py-2 text-[11px] font-mono text-amber-100 hover:bg-amber-400/20"
-                                onClick={() =>
-                                  void triggerOutboundShare({
-                                    event: 'challenge_link_clicked',
-                                    source: 'leaderboard_mobile_row',
-                                    challenger: currentActorHandleForTelemetry,
-                                    target: entry.handle,
-                                    title: 'Mentat Velocity Challenge',
-                                    text: `I challenge @${entry.handle} on Mentat Velocity.`,
-                                    url: challengeEntryUrl,
-                                  })
-                                }
-                                type="button"
-                              >
-                                Challenge
-                              </button>
-                            ) : (
-                              <a
-                                className="min-h-11 inline-flex items-center rounded border border-amber-400/40 px-3 py-2 text-[11px] font-mono text-amber-100 hover:bg-amber-400/10"
-                                href="/api/auth/github/start"
-                                onClick={() => trackUxEvent('claim_profile_clicked', { source: 'leaderboard_mobile_row_challenge_gate', signedIn: false })}
-                              >
-                                Claim to Challenge
-                              </a>
-                            )}
+                                Accel {formatAcceleration(entry.totals.velocityAcceleration)}
+                              </p>
+                            </div>
                           </div>
                         </div>
                       );
                     })}
                   </div>
                   <div className="overflow-x-auto rounded-lg border border-slate-800/80 bg-slate-950/35">
-                    <table className="hidden w-full min-w-[720px] text-left text-sm sm:table">
-                      <thead className="border-b border-slate-700 font-mono text-xs uppercase tracking-wide text-ink-3">
+                    <table className="hidden w-full min-w-[780px] text-left text-sm sm:table">
+                      <thead className="sticky top-0 z-10 border-b border-slate-700 bg-slate-950/95 font-mono text-xs uppercase tracking-wide text-ink-3 backdrop-blur">
                         <tr>
-                          <th className="px-2 py-2">Rank</th>
-                          <th className="px-2 py-2">Seed Handle</th>
-                          <th className="px-2 py-2">Top Repo</th>
-                          <th className="px-2 py-2" title="Equivalent engineering hours heuristic for the current 30-day window.">
-                            EEH (30d)
-                          </th>
-                          <th
-                            className="px-2 py-2"
-                            title="Merged pull requests in the current 30-day window targeting the default branch with successful CI at merge commit time."
-                          >
-                            Merged PRs (CI-verified)
-                          </th>
-                          <th
-                            className="px-2 py-2"
-                            title="Merged pull requests in the current 30-day window targeting the default branch before CI verification filtering."
-                          >
-                            Merged PRs (Unverified)
-                          </th>
-                          <th className="px-2 py-2">Commits/Day</th>
-                          <th className="px-2 py-2">Active Hrs</th>
-                          <th className="px-2 py-2">Off-Hours</th>
-                          <th className="px-2 py-2">EEH Accel</th>
+                          {LEADERBOARD_DESKTOP_COLUMNS.map((column) => (
+                            <th key={column} className="px-3 py-2">
+                              {column}
+                            </th>
+                          ))}
                         </tr>
                       </thead>
                       <tbody>
                         {!leaderboardError && !leaderboard ? (
                           <tr className="border-b border-slate-800/80">
-                            <td className="px-2 py-6 text-center text-ink-2" colSpan={10}>
+                            <td className="px-3 py-6 text-center text-ink-2" colSpan={LEADERBOARD_DESKTOP_COLUMNS.length}>
                               Loading leaderboard artifact...
                             </td>
                           </tr>
                         ) : null}
                         {!leaderboardError && leaderboard && leaderboard.entries.length === 0 ? (
                           <tr className="border-b border-slate-800/80">
-                            <td className="px-2 py-6 text-center text-ink-2" colSpan={10}>
+                            <td className="px-3 py-6 text-center text-ink-2" colSpan={LEADERBOARD_DESKTOP_COLUMNS.length}>
                               No leaderboard entries available yet. Run bootstrap to generate data.
                             </td>
                           </tr>
                         ) : null}
                         {sortedEntries.map((entry) => {
-                          const verificationPresentation = buildVerificationPresentation(entry.trust?.verification);
-                          const anomalySummary = summarizeAnomalies(entry.trust?.anomalies, 2);
-
+                          const percentile = getPercentile(entry, sortedEntries.length);
+                          const tier = getTier(entry, percentile);
+                          const tierBadge = getTierBadge(tier);
+                          const trustBadge = getTrustBadge(entry.trust?.verification?.state);
+                          const rankTone = getRankTone(entry.rank);
+                          const isMuted = hasZeroLeaderboardMetrics(entry);
                           return (
-                            <tr key={entry.handle} className="border-b border-slate-800/80 transition-colors hover:bg-surface-2">
-                              <td className="px-2 py-3 font-mono text-accent-2">#{entry.rank}</td>
-                              <td className="px-2 py-3">
-                                <button className="font-medium hover:text-accent-2" onClick={() => openProfile(entry.handle)} type="button">
-                                  @{entry.handle}
-                                </button>
-                                <p className="font-mono text-xs text-ink-3">{entry.scannedRepos} repo(s) scanned</p>
-                                {entry.aiReadyScore === undefined ? (
-                                  <p className="font-mono text-xs text-ink-3">AI-Ready: trust-labeled pending Scan payload</p>
-                                ) : (
-                                  <p className="font-mono text-xs text-ink-3">AI-Ready: {entry.aiReadyScore}%</p>
-                                )}
-                                <p className="font-mono text-xs text-ink-3">{entry.scanInsight ?? buildScanActionRecommendation(entry).detail}</p>
-                                <div className={`mt-2 rounded border px-2 py-1 text-xs ${verificationPresentation.toneClass}`}>
-                                  <p className="font-mono uppercase tracking-[0.08em]">{verificationPresentation.label}</p>
-                                  <p className="mt-1">{compactReasonText(verificationPresentation.reason, 106)}</p>
-                                </div>
-                                {anomalySummary.visible.length > 0 ? (
-                                  <div className="mt-2 space-y-1">
-                                    {anomalySummary.visible.map((flag) => (
-                                      <div
-                                        key={`${entry.handle}-${flag.key}-${flag.reason}`}
-                                        className={`rounded border px-2 py-1 text-xs ${getAnomalySeverityToneClasses(flag.severity)}`}
-                                      >
-                                        <p className="font-mono uppercase tracking-[0.08em]">
-                                          Severity {flag.severity.toUpperCase()} | {flag.label}
-                                        </p>
-                                        <p className="mt-1">{compactReasonText(flag.reason, 96)}</p>
-                                      </div>
-                                    ))}
-                                    {anomalySummary.remaining > 0 ? (
-                                      <p className="text-xs text-ink-3">+{anomalySummary.remaining} additional anomaly flag(s)</p>
-                                    ) : null}
+                            <tr
+                              key={entry.handle}
+                              className={`cursor-pointer border-b border-slate-800/80 transition-colors hover:bg-slate-800/50 ${
+                                entry.rank <= 3 ? 'bg-amber-500/[0.03]' : ''
+                              }`}
+                              onClick={() => openProfile(entry.handle)}
+                              onKeyDown={(event) => {
+                                if (event.key === 'Enter' || event.key === ' ') {
+                                  event.preventDefault();
+                                  openProfile(entry.handle);
+                                }
+                              }}
+                              role="button"
+                              tabIndex={0}
+                            >
+                              <td className="px-3 py-3">
+                                <span className={`inline-flex rounded-full border px-2 py-0.5 font-mono text-xs ${rankTone.badgeClassName}`}>#{entry.rank}</span>
+                              </td>
+                              <td className="px-3 py-3">
+                                <div className="flex items-center gap-3">
+                                  <div className="relative h-9 w-9 overflow-hidden rounded-full border border-slate-700 bg-slate-900/80">
+                                    <span className="absolute inset-0 flex items-center justify-center font-mono text-xs text-ink-2">
+                                      {entry.handle.slice(0, 1).toUpperCase()}
+                                    </span>
+                                    <img
+                                      alt={`GitHub avatar for @${entry.handle}`}
+                                      className="absolute inset-0 h-full w-full object-cover"
+                                      onError={(event) => {
+                                        event.currentTarget.style.visibility = 'hidden';
+                                      }}
+                                      src={`https://github.com/${encodeURIComponent(entry.handle)}.png?size=72`}
+                                    />
                                   </div>
-                                ) : null}
-                                <div className="mt-2 flex flex-wrap gap-2">
-                                  {entry.featuredRepo ? (
-                                    <button
-                                      className="min-h-11 rounded border border-emerald-400/50 bg-emerald-500/10 px-3 py-2 font-mono text-[11px] text-emerald-100 hover:bg-emerald-500/20"
-                                      onClick={() => startScanFromRepo(entry.featuredRepo!, 'leaderboard_table_row')}
-                                      type="button"
-                                    >
-                                      Run Scan
-                                    </button>
-                                  ) : null}
-                                  <button
-                                    className="min-h-11 rounded border border-cyan-400/50 bg-cyan-500/10 px-3 py-2 font-mono text-[11px] text-cyan-100 hover:bg-cyan-500/20"
-                                    onClick={() =>
-                                      void triggerOutboundShare({
-                                        event: 'profile_share_clicked',
-                                        source: 'leaderboard_table_row',
-                                        handle: entry.handle,
-                                        title: 'Mentat Velocity Profile',
-                                        text: `Mentat Velocity profile check: @${entry.handle} is currently #${entry.rank}.`,
-                                        url: buildProfileUrl(appOrigin, entry.handle),
-                                      })
-                                    }
-                                    type="button"
-                                  >
-                                    Share
-                                  </button>
-                                  <button
-                                    className="min-h-11 rounded border border-cyan-400/40 px-3 py-2 font-mono text-[11px] text-cyan-100 hover:bg-cyan-500/15"
-                                    onClick={() =>
-                                      void copyShareLink({
-                                        event: 'profile_share_clicked',
-                                        source: 'leaderboard_table_row',
-                                        handle: entry.handle,
-                                        url: buildProfileUrl(appOrigin, entry.handle),
-                                      })
-                                    }
-                                    type="button"
-                                  >
-                                    Copy
-                                  </button>
-                                  {challengeActorHandle && entry.handle !== normalizedActorHandle ? (
-                                    <button
-                                      className="min-h-11 rounded border border-amber-400/50 bg-amber-400/10 px-3 py-2 font-mono text-[11px] text-amber-100 hover:bg-amber-400/20"
-                                      onClick={() =>
-                                        void triggerOutboundShare({
-                                          event: 'challenge_link_clicked',
-                                          source: 'leaderboard_table_row',
-                                          challenger: currentActorHandleForTelemetry,
-                                          target: entry.handle,
-                                          title: 'Mentat Velocity Challenge',
-                                          text: `I challenge @${entry.handle} on Mentat Velocity.`,
-                                          url: buildChallengeLink(appOrigin, challengeActorHandle, entry.handle) ?? buildProfileUrl(appOrigin, entry.handle),
-                                        })
-                                      }
-                                      type="button"
-                                    >
-                                      Challenge
-                                    </button>
-                                  ) : (
-                                    <a
-                                      className="min-h-11 inline-flex items-center rounded border border-amber-400/40 px-3 py-2 font-mono text-[11px] text-amber-100 hover:bg-amber-400/10"
-                                      href="/api/auth/github/start"
-                                      onClick={() => trackUxEvent('claim_profile_clicked', { source: 'leaderboard_table_row_challenge_gate', signedIn: false })}
-                                    >
-                                      Claim to Challenge
-                                    </a>
-                                  )}
+                                  <p className={`font-medium ${entry.rank <= 3 ? rankTone.textClassName : 'text-ink-1'}`}>@{entry.handle}</p>
                                 </div>
                               </td>
-                              <td className="px-2 py-3">
-                                {entry.featuredRepo ? (
-                                  <a href={entry.featuredRepo} className="text-xs text-ink-2 hover:text-accent-2 hover:underline" rel="noreferrer" target="_blank">
-                                    {entry.featuredRepo.replace('https://github.com/', '')}
-                                  </a>
-                                ) : (
-                                  <span className="text-xs text-ink-3">-</span>
-                                )}
+                              <td className="px-3 py-3">
+                                <div className="flex flex-wrap items-center gap-1">
+                                  <span className={`rounded-full border px-2 py-0.5 font-mono text-[11px] ${tierBadge.className}`}>
+                                    {tierBadge.label}
+                                  </span>
+                                  <span className={`rounded-full border px-2 py-0.5 font-mono text-[11px] ${trustBadge.className}`}>
+                                    {trustBadge.label}
+                                  </span>
+                                </div>
                               </td>
-                              <td className="px-2 py-3 font-mono">{formatNumber(entry.totals.equivalentEngineeringHours, 1)}</td>
-                              <td className="px-2 py-3 font-mono">{formatNumber(entry.totals.mergedPrsCiVerified, 0)}</td>
-                              <td className="px-2 py-3 font-mono text-ink-3">{formatNumber(entry.totals.mergedPrsUnverified, 0)}</td>
-                              <td className="px-2 py-3 font-mono">{formatNumber(entry.totals.commitsPerDay)}</td>
-                              <td className="px-2 py-3 font-mono">{formatNumber(entry.totals.activeCodingHours, 0)}</td>
-                              <td className="px-2 py-3 font-mono">{formatPercent(entry.totals.offHoursRatio)}</td>
-                              <td className={`px-2 py-3 font-mono ${entry.totals.velocityAcceleration >= 0 ? 'text-state-success' : 'text-state-warning'}`}>
+                              <td className={`px-3 py-3 font-mono text-lg font-semibold ${isMuted ? 'text-ink-3' : 'text-cyan-100'}`}>
+                                {formatNumber(entry.totals.equivalentEngineeringHours, 1)}
+                              </td>
+                              <td className={`px-3 py-3 font-mono ${isMuted ? 'text-ink-3' : 'text-ink-1'}`}>
+                                {formatNumber(entry.totals.mergedPrsCiVerified, 0)}
+                              </td>
+                              <td
+                                className={`px-3 py-3 font-mono ${
+                                  isMuted ? 'text-ink-3' : entry.totals.velocityAcceleration >= 0 ? 'text-state-success' : 'text-state-warning'
+                                }`}
+                              >
                                 {formatAcceleration(entry.totals.velocityAcceleration)}
                               </td>
                             </tr>
@@ -2779,6 +2626,9 @@ export function App() {
                       </tbody>
                     </table>
                   </div>
+                  <p className="mt-4 rounded-md border border-slate-700/80 bg-surface-2/80 px-3 py-2 text-xs text-ink-2">
+                    Metric notes: EEH is a heuristic from CI-verified merged PR throughput. Velocity acceleration compares the current 30-day window against the previous 30 days. Detailed diagnostics live on each profile page.
+                  </p>
                 </section>
               ) : (
                 <section className="rounded-xl border border-slate-700/80 bg-surface-1 p-4 shadow-soft md:p-5">
@@ -3041,37 +2891,18 @@ export function App() {
                         </div>
                       </div>
 
-                      <div className="mt-4 overflow-hidden rounded-md border border-slate-700">
-                        <div className="border-b border-slate-700 bg-slate-900 px-3 py-2 font-mono text-xs uppercase tracking-wide text-ink-3">
-                          Raw Report Card JSON
+                      {debugEnabled ? (
+                        <div className="mt-4 overflow-hidden rounded-md border border-slate-700">
+                          <div className="border-b border-slate-700 bg-slate-900 px-3 py-2 font-mono text-xs uppercase tracking-wide text-ink-3">
+                            Raw Report Card JSON
+                          </div>
+                          <pre className="overflow-auto bg-slate-950/80 p-3 text-xs text-ink-2">{JSON.stringify(scanResult, null, 2)}</pre>
                         </div>
-                        <pre className="overflow-auto bg-slate-950/80 p-3 text-xs text-ink-2">{JSON.stringify(scanResult, null, 2)}</pre>
-                      </div>
+                      ) : null}
                     </div>
                   ) : null}
                 </section>
               )}
-            </section>
-
-            <aside className="space-y-4 lg:col-span-4">
-              <section className="rounded-xl border border-slate-700/80 bg-surface-1 p-4 shadow-soft md:p-5 lg:sticky lg:top-6">
-                <h3 className="font-display text-lg">Metric Notes</h3>
-                <ul className="mt-3 space-y-3 text-sm text-ink-2">
-                  <li>
-                    <span className="text-ink-1">Off-hours ratio</span> uses unique UTC commit hours outside 09:00-18:00.
-                  </li>
-                  <li>
-                    <span className="text-ink-1">Velocity acceleration</span> compares current 30d EEH/day against previous 30d.
-                  </li>
-                  <li>
-                    <span className="text-ink-1">Merged PR scoring</span> is default-branch scoped and CI-verified via checks/status on the merge commit.
-                  </li>
-                  <li>
-                    <span className="text-ink-1">Equivalent engineering hours</span> is a heuristic proxy, not a timesheet.
-                  </li>
-                </ul>
-              </section>
-            </aside>
           </div>
         )}
       </main>

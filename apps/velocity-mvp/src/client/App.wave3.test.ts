@@ -1,9 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  HERO_PRIMARY_CTA_LABEL,
+  HERO_SEARCH_PROMPT,
+  LEADERBOARD_DESKTOP_COLUMNS,
   buildFreshnessPresentation,
   buildVerificationPresentation,
   compactReasonText,
+  isDebugEnabled,
   mapFreshnessStaleReasonCode,
   mapVerificationReasonCode,
   summarizeAnomalies,
@@ -143,5 +147,28 @@ describe('wave3 freshness/trust helper contracts', () => {
 
     expect(summary.visible).toHaveLength(2);
     expect(summary.remaining).toBe(1);
+  });
+
+  it('locks leaderboard hero copy and streamlined desktop columns', () => {
+    expect(HERO_SEARCH_PROMPT).toBe('Search your GitHub handle to see your Velocity.');
+    expect(HERO_PRIMARY_CTA_LABEL).toBe('Connect GitHub to Claim Profile');
+    expect(LEADERBOARD_DESKTOP_COLUMNS).toEqual([
+      'Rank',
+      'Dev',
+      'Operating Stack',
+      'EEH (30d)',
+      'Merged PRs (CI-Verified)',
+      'Velocity Accel',
+    ]);
+    expect(LEADERBOARD_DESKTOP_COLUMNS).not.toContain('Merged PRs (Unverified)');
+    expect(LEADERBOARD_DESKTOP_COLUMNS).not.toContain('Commits/Day');
+    expect(LEADERBOARD_DESKTOP_COLUMNS).not.toContain('Off-Hours');
+  });
+
+  it('gates debug surfaces behind debug=true query', () => {
+    expect(isDebugEnabled('?debug=true')).toBe(true);
+    expect(isDebugEnabled('?debug=false')).toBe(false);
+    expect(isDebugEnabled('?challenge=peer')).toBe(false);
+    expect(isDebugEnabled('?debug=1')).toBe(false);
   });
 });
